@@ -422,8 +422,7 @@ fn allow_subscribe_accepts_created_and_snapshot_loaded() {
 }
 /// Regression: `subscribe()` must not regress the phase below
 /// `SnapshotLoaded` when the core already has a snapshot loaded (the
-/// construction-time-load path: `load_snapshot_from_db` at `Bot`
-/// construction → `subscribe`). The snapshot is loaded into the shared
+/// complete pool initialization before `subscribe`). The snapshot is loaded into the shared
 /// core `BotState` and never advances the engine phase, so an
 /// unconditional `set_phase(Subscribed)` after subscribe left the phase
 /// at `Subscribed` (1) and `resume()`'s `require(SnapshotLoaded)` guard
@@ -443,8 +442,7 @@ fn after_subscribe_advances_to_snapshot_loaded_when_core_has_snapshot() {
         PumpPhase::Subscribed,
         "legacy path: no core snapshot → Subscribed after subscribe"
     );
-    // Construction-time-load path: core has a snapshot (loaded at `Bot`
-    // construction via `load_snapshot_from_db`). subscribe from Created →
+    // The core already has a complete pool snapshot: subscribe from Created →
     // SnapshotLoaded (NOT Subscribed — that was the crash).
     assert_eq!(
         PumpPhase::after_subscribe(PumpPhase::Created, true),

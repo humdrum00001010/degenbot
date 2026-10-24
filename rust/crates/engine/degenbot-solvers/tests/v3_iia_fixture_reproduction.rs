@@ -40,21 +40,14 @@
 
 #![expect(clippy::too_many_lines, clippy::doc_markdown)]
 
-use hashbrown::HashMap;
-use std::sync::Arc;
-
 use alloy::primitives::{Address, I256, U256};
 
-use degenbot_pools::registry::ConcentratedLiquidityPoolMut;
-use degenbot_pools::tick_fetch::{FetchTickWordError, FetchedTickWord, TickWordFetcher};
 use degenbot_pools::v3_state::{
     v3_simulate_swap, PoolTickCoverage, RegisterV3PoolParams, SimulateSwapError, V3PoolState,
     V3SwapOutcome,
 };
-use degenbot_pools::TickBootstrapRpc;
-use degenbot_rpc::abi::fetch_v3_slot0_liquidity;
 use degenbot_rpc::provider::AlloyProvider;
-use degenbot_rpc::AlloyTickBootstrapRpc;
+use degenbot_rpc::{TickMapProtocol, TickMapRequest};
 use degenbot_solvers::cl::{simulate_v3_range_swap, IntV3TickRangeSequence};
 
 /// Hardcoded fixture from the captured `DEGENBOT_SIM_EXIT_ON_FAIL=1` trap
@@ -68,46 +61,6 @@ const TICK_SPACING: i32 = 10;
 const AMOUNT_IN: u128 = 50_868_891_135; // hop[0] matched output → hop[1] amount_in
 const CAPTURED_ACTUAL: u128 = 150_836_781_502; // revm sim measured hop[1] output
 const CAPTURED_PREDICTED: u128 = 150_836_781_515; // solver hop_outputs[1] (+13)
-
-/// `TickWordFetcher` backed by `AlloyTickBootstrapRpc` (address-keyed bootstrap
-/// impl). The miss-path trait passes `word`; this picks a tick landing in that
-/// word and delegates to the bootstrap (which recomputes the word internally).
-#[derive(Debug)]
-struct BootstrapFetcher {
-    address: Address,
-    rpc: Arc<AlloyTickBootstrapRpc>,
-}
-
-impl TickWordFetcher for BootstrapFetcher {
-    fn fetch_missing_tick_word(
-        &self,
-        _pool_id: u64,
-        word: i32,
-        block: u64,
-    ) -> Result<FetchedTickWord, FetchTickWordError> {
-        // tick whose word-position == `word`: `word * 256 * spacing`.
-        // `tick.div_euclid(spacing) >> 8 == word` holds for both signs
-        // (arithmetic shift; exact divisibility by spacing).
-        let tick = word
-            .checked_mul(256)
-            .and_then(|t| t.checked_mul(TICK_SPACING))
-            .ok_or(FetchTickWordError::OutOfRange)?;
-        let result = self
-            .rpc
-            .bootstrap_v3_tick_word(&self.address.to_string(), tick, TICK_SPACING, block)
-            .map_err(|_| FetchTickWordError::FetchFailed)?;
-        Ok(match result {
-            None => FetchedTickWord {
-                word,
-                ticks: HashMap::new(),
-            },
-            Some(b) => FetchedTickWord {
-                word: b.word,
-                ticks: b.ticks,
-            },
-        })
-    }
-}
 
 /// The solver's CL-hop output for `amount_in` (mirrors
 /// `v3_crossing_solver_vs_sim_parity::solver_crossing_output`).
@@ -148,32 +101,33 @@ fn v3_iia_fixture_reproduces_plus_thirteen_divergence() {
         .unwrap_or(FIXTURE_BLOCK);
 
     let pool: Address = POOL_ADDRESS.parse().expect("valid address");
-    // Run ONLY the async I/O setup (provider construction + slot0/liquidity
-    // fetch) on a throwaway tokio runtime, then DROP it so the subsequent
-    // `bootstrap_v3_tick_word` calls (which internally call
-    // `degenbot_core::runtime::get_runtime().block_on(...)`) do not nest a
-    // block_on inside this test's runtime (which panics with
-    // "Cannot start a runtime from within a runtime").
-    let (provider, sqrt_price_x96, tick_i256, liquidity_u256) = tokio::runtime::Runtime::new()
+    // Read a complete map at the fixture block; no later tick-word RPCs are
+    // needed while simulating or constructing solver ranges.
+    let snapshot = tokio::runtime::Runtime::new()
         .expect("setup runtime")
         .block_on(async {
-            let provider = Arc::new(AlloyProvider::new(&rpc_url, 3).await.expect("provider"));
-            // 1. Fetch on-chain slot0 + liquidity at the captured block.
-            let (sp, tick_wide, liq) = fetch_v3_slot0_liquidity(&provider, &pool, Some(block))
+            let provider = AlloyProvider::new(&rpc_url, 3).await.expect("provider");
+            let request = TickMapRequest {
+                address: pool,
+                protocol: TickMapProtocol::UniswapV3,
+                tick_spacing: TICK_SPACING,
+                pool_id: None,
+            };
+            provider
+                .get_tick_maps(&[request], block.into())
                 .await
-                .expect("fetch slot0+liquidity");
-            (provider, sp, tick_wide, liq)
+                .expect("complete tick map")
+                .pools
+                .into_iter()
+                .next()
+                .expect("one pool snapshot")
         });
-    let tick: i32 = tick_i256.try_into().expect("tick fits i32");
-    let liquidity: u128 = liquidity_u256.to::<u128>();
-    eprintln!("block={block} sqrtPriceX96={sqrt_price_x96} tick={tick} liquidity={liquidity}");
+    eprintln!(
+        "block={block} sqrtPriceX96={} tick={} liquidity={}",
+        snapshot.sqrt_price_x96, snapshot.tick, snapshot.liquidity
+    );
 
-    // 2. Build a Sparse V3PoolState with the bootstrap-backed fetcher.
-    let bootstrap = Arc::new(AlloyTickBootstrapRpc::new(Arc::clone(&provider)));
-    let fetcher: Arc<dyn TickWordFetcher> = Arc::new(BootstrapFetcher {
-        address: pool,
-        rpc: Arc::clone(&bootstrap),
-    });
+    // Build tracked state directly from the complete snapshot.
     let params = RegisterV3PoolParams {
         address: pool,
         token0: Address::ZERO,
@@ -181,56 +135,46 @@ fn v3_iia_fixture_reproduces_plus_thirteen_divergence() {
         fee: FEE,
         tick_spacing: TICK_SPACING,
         factory: Address::ZERO,
-        sqrt_price_x96,
-        liquidity,
-        tick,
-        tick_data: HashMap::new(),
+        sqrt_price_x96: snapshot.sqrt_price_x96,
+        liquidity: snapshot.liquidity,
+        tick: snapshot.tick,
+        tick_data: snapshot.tick_map(block),
         update_block: block,
-        tick_data_block: None,
-        coverage: PoolTickCoverage::Sparse,
-        fetcher: Some(Arc::clone(&fetcher)),
+        tick_data_block: Some(block),
+        coverage: PoolTickCoverage::Tracked,
+        fetcher: None,
         deployer: Address::ZERO,
         init_hash: alloy::primitives::B256::ZERO,
         slot_layout: degenbot_pools::ClSlotLayout::UniswapV3,
     };
-    let (_identity, mut state) = V3PoolState::from_params(params, 8);
+    let (_identity, state) = V3PoolState::from_params(params, 8);
 
-    // 3. Run v3_simulate_swap with the fetch-merge-retry miss loop (the
-    //    production pattern — `v3_simulate_swap` returns `MissingTickWord` and
-    //    the caller merges + retries).
+    // Run the captured swap against the complete tracked state.
     let zero_for_one = false; // ofz
     let amount_specified = I256::try_from(U256::from(AMOUNT_IN)).unwrap();
     let limit = V3PoolState::default_sqrt_price_limit(zero_for_one);
-    let sim_out = loop {
-        match v3_simulate_swap(
-            &state,
-            FEE,
-            TICK_SPACING,
-            zero_for_one,
-            amount_specified,
-            limit,
-        ) {
-            Ok(o) => break v3_exact_in_output_ofz(&o),
-            Err(SimulateSwapError::MissingTickWord(word)) => {
-                let new_word = fetcher
-                    .fetch_missing_tick_word(0, word, block)
-                    .expect("fetch missing word");
-                // `merge_tick_word` marks the word known + invalidates the
-                // tick-range cache (so the retry sees the new ticks).
-                state.merge_tick_word(&new_word);
-            }
-            Err(e) => panic!("v3_simulate_swap error: {e:?}"),
+    let sim_out = match v3_simulate_swap(
+        &state,
+        FEE,
+        TICK_SPACING,
+        zero_for_one,
+        amount_specified,
+        limit,
+    ) {
+        Ok(outcome) => v3_exact_in_output_ofz(&outcome),
+        Err(SimulateSwapError::MissingTickWord(word)) => {
+            panic!("complete snapshot missed tick word {word}");
         }
+        Err(error) => panic!("v3_simulate_swap error: {error:?}"),
     };
 
     eprintln!("sim(v3_simulate_swap)={sim_out}");
 
-    // 4. Build the solver's sequence from the (now backfilled) state and run
+    // Build the solver's sequence from the snapshot state and run
     //    the solver crossing path on the SAME amount_in.
     let Some(seq) = state.build_int_v3_sequence(TICK_SPACING, FEE, zero_for_one) else {
         eprintln!(
-            "build_int_v3_sequence returned None — sparse backfill only \
-             seeded words the swap touched; the solver's 24-range walk needs more. \
+            "build_int_v3_sequence returned None for the complete snapshot; \
              sim_out alone is the decisive signal (see assertion below)."
         );
         assert_eq!(

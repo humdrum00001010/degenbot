@@ -957,11 +957,7 @@ class PathRegistrationPipeline:
         ordering guarantee), so the Progress summary's counter drift and the
         1000-boundary log lines keep their retired shapes exactly.
 
-        Returns with EVERY submitted receipt resolved (the completion clause
-        that replaced the retired executor-drain: all cloned
-        ``Arc<SnapshotDb>`` handles acquired inside units are dropped before
-        ``build_paths`` returns, keeping the close_snapshot_tx()
-        Arc::try_unwrap canary quiet). The unit's fatal exception
+        Returns with every submitted receipt resolved. The unit's fatal exception
         (VerificationMismatchError / VerificationRpcError /
         DirectionResolutionError) propagates through the receipt and aborts
         the crawl loudly — the "shut down" contract, unchanged. On a fatal

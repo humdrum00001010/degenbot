@@ -41,8 +41,7 @@ use degenbot_pool_updater::run::{self, NoProgress, ProgressSink, RunError, Updat
 /// `dict`-return idiom from `67691f7c`).
 ///
 /// Shape: `{"chain_id": int, "from_block": int, "to_block": int,
-/// "chunks_committed": int, "total_pools_written": int,
-/// "total_liquidity_applies": int}`.
+/// "chunks_committed": int, "total_pools_written": int}`.
 fn update_report_to_dict(py: Python<'_>, r: &UpdateReport) -> PyResult<Py<PyDict>> {
     let dict = PyDict::new(py);
     dict.set_item("chain_id", r.chain_id)?;
@@ -50,7 +49,6 @@ fn update_report_to_dict(py: Python<'_>, r: &UpdateReport) -> PyResult<Py<PyDict
     dict.set_item("to_block", r.to_block)?;
     dict.set_item("chunks_committed", r.chunks_committed)?;
     dict.set_item("total_pools_written", r.total_pools_written)?;
-    dict.set_item("total_liquidity_applies", r.total_liquidity_applies)?;
     Ok(dict.unbind())
 }
 
@@ -92,7 +90,7 @@ fn update_report_to_dict(py: Python<'_>, r: &UpdateReport) -> PyResult<Py<PyDict
 /// # Returns
 ///
 /// A `dict` `{chain_id, from_block, to_block, chunks_committed,
-/// total_pools_written, total_liquidity_applies}`.
+/// total_pools_written}`.
 ///
 /// # Raises
 ///
@@ -114,12 +112,7 @@ fn update_report_to_dict(py: Python<'_>, r: &UpdateReport) -> PyResult<Py<PyDict
     chunk_size,
     rpc_url,
     cancel_handle,
-    verify_chunk = false,
-    *,
-    verify_all_interval = None,
-    verify_all_at_completion = false,
 ))]
-#[expect(clippy::too_many_arguments)]
 fn run_pool_update(
     py: Python<'_>,
     database_path: &str,
@@ -128,9 +121,6 @@ fn run_pool_update(
     chunk_size: u64,
     rpc_url: &str,
     cancel_handle: &CancelHandle,
-    verify_chunk: bool,
-    verify_all_interval: Option<u64>,
-    verify_all_at_completion: bool,
 ) -> PyResult<Py<PyDict>> {
     let path = PathBuf::from(database_path);
     let cancel = cancel_handle.flag.clone();
@@ -154,16 +144,7 @@ fn run_pool_update(
                 .block_on(AlloyProvider::new(rpc_url, 5))
                 .map_err(RunError::from)?;
             run::run_pool_update(
-                &path,
-                chain_id,
-                to_block,
-                chunk_size,
-                provider,
-                cancel,
-                progress,
-                verify_chunk,
-                verify_all_interval,
-                verify_all_at_completion,
+                &path, chain_id, to_block, chunk_size, provider, cancel, progress,
             )
         })
         .map_err(run_err_to_py)?;
@@ -174,18 +155,8 @@ fn run_pool_update(
 /// `degenbot._ffi.pool.verify_v3_liquidity_map(database_path, rpc_url, chain_id,
 /// pool_address, block_number) -> list[dict]`
 ///
-/// Standalone on-chain-truth verification of a V3 pool's COMMITTED liquidity
-/// map (read-only — no SQL writes, no event apply). Opens the DB, fetches the
-/// pool's `liquidity_positions` + `initialization_maps` rows, builds the
-/// in-memory map, + compares EVERY tick + bitmap word against on-chain
-/// `IUniswapV3Pool.ticks(int24)` / `tickBitmap(int16)` at `block_number`, all
-/// batched through Multicall3. Returns the divergence list (empty = GREEN —
-/// the DB matches the chain at `block_number`).
-///
-/// This is the ad-hoc / spot-check sibling of the pre-commit gate
-/// (`run_pool_update(verify=True)`); the gate runs the SAME core verify
-/// BEFORE the write commits, while this reads the already-committed state.
-/// Per-position `eth_call`s are batched via Multicall3.
+/// Compare a complete Erigon map at `block_number` with ordinary V3 getters.
+/// The database supplies only catalog identity and spacing.
 ///
 /// The GIL is released across the whole call (`py.detach`); the `AlloyProvider`
 /// is owned internally and the call runs on the ambient tokio runtime — a
@@ -201,15 +172,15 @@ fn verify_v3_liquidity_map(
     pool_address: &str,
     block_number: u64,
 ) -> PyResult<Vec<Py<PyDict>>> {
-    use degenbot_db::{ComputedLiquidityUpdate, DegenbotDb};
-    use degenbot_pool_updater::verify_v3_liquidity_map_on_chain;
+    use degenbot_db::DegenbotDb;
+    use degenbot_pool_updater::{catalog_tick_map_request, verify_tick_map_snapshot};
+    use degenbot_rpc::liquidity_verifier::LiquidityMapTarget;
     use degenbot_rpc::provider::AlloyProvider;
 
     let path = PathBuf::from(database_path);
     let addr: alloy::primitives::Address = pool_address
         .parse()
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("bad pool_address: {e}")))?;
-    let addr_str = addr.to_checksum(None);
 
     let divergences = py
         .detach(move || {
@@ -225,26 +196,17 @@ fn verify_v3_liquidity_map(
             };
             let db = DegenbotDb::open(&path).map_err(RunError::Db)?.0;
             let conn = db.lock();
-            let state = DegenbotDb::fetch_v3_pool_update_state_on_conn(&conn, chain_id, &addr_str)
-                .map_err(RunError::Db)?
-                .ok_or_else(|| {
-                    RunError::Db(degenbot_db::DbError::Decode(format!(
-                        "v3 pool {addr_str} not found on chain {chain_id}"
-                    )))
-                })?;
-            let (tick_bitmap, tick_data) =
-                DegenbotDb::fetch_v3_liquidity_map_on_conn(&conn, state.pool_id)
-                    .map_err(RunError::Db)?;
-            let computed = ComputedLiquidityUpdate {
-                pool_id: state.pool_id,
-                tick_spacing: state.tick_spacing,
-                tick_data,
-                tick_bitmap,
-                last_event: None,
-            };
-            let provider = handle.block_on(AlloyProvider::new(rpc_url, 5))?;
-            let fut = verify_v3_liquidity_map_on_chain(&provider, addr, &computed, block_number);
-            tokio::task::block_in_place(|| handle.block_on(fut))
+            let request = catalog_tick_map_request(&conn, chain_id, LiquidityMapTarget::V3(addr))?;
+            drop(conn);
+            let chain = u64::try_from(chain_id).map_err(|_| {
+                RunError::Db(degenbot_db::DbError::Decode("invalid chain_id".into()))
+            })?;
+            tokio::task::block_in_place(|| {
+                handle.block_on(async {
+                    let provider = AlloyProvider::for_chain(rpc_url, chain, 5).await?;
+                    verify_tick_map_snapshot(&provider, request, block_number).await
+                })
+            })
         })
         .map_err(run_err_to_py)?;
 
@@ -254,12 +216,8 @@ fn verify_v3_liquidity_map(
 /// `degenbot._ffi.pool.verify_v4_liquidity_map(database_path, rpc_url, chain_id,
 /// pool_hash, pool_manager_address, block_number) -> list[dict]`
 ///
-/// Standalone on-chain-truth verification of a V4 pool's COMMITTED liquidity
-/// map via the singleton `PoolManager.extsload(bytes32[])` at `block_number`
-/// (read-only — mirrors [`verify_v3_liquidity_map`]). `pool_hash` is the V4
-/// `PoolId` (bytes32 hex, `0x…`); `pool_manager_address` is the deployed V4
-/// `PoolManager` singleton (the chain has one — it's the V4 exchange's
-/// `factory`). Returns the divergence list (empty = GREEN).
+/// Compare a complete Erigon map at `block_number` with `PoolManager` getters.
+/// The database supplies only catalog identity and spacing.
 ///
 /// The GIL is released across the whole call; the provider is owned
 /// internally and the call runs on the ambient tokio runtime (a missing
@@ -276,8 +234,9 @@ fn verify_v4_liquidity_map(
     pool_manager_address: &str,
     block_number: u64,
 ) -> PyResult<Vec<Py<PyDict>>> {
-    use degenbot_db::{ComputedLiquidityUpdate, DegenbotDb};
-    use degenbot_pool_updater::verify_v4_liquidity_map_on_chain;
+    use degenbot_db::DegenbotDb;
+    use degenbot_pool_updater::{catalog_tick_map_request, verify_tick_map_snapshot};
+    use degenbot_rpc::liquidity_verifier::LiquidityMapTarget;
     use degenbot_rpc::provider::AlloyProvider;
     use std::str::FromStr;
 
@@ -300,32 +259,24 @@ fn verify_v4_liquidity_map(
             };
             let db = DegenbotDb::open(&path).map_err(RunError::Db)?.0;
             let conn = db.lock();
-            let state = DegenbotDb::fetch_v4_pool_update_state_on_conn(&conn, pool_hash, chain_id)
-                .map_err(RunError::Db)?
-                .ok_or_else(|| {
-                    RunError::Db(degenbot_db::DbError::Decode(format!(
-                        "v4 pool {pool_hash} not found on chain {chain_id}"
-                    )))
-                })?;
-            let (tick_bitmap, tick_data) =
-                DegenbotDb::fetch_v4_liquidity_map_on_conn(&conn, state.pool_id)
-                    .map_err(RunError::Db)?;
-            let computed = ComputedLiquidityUpdate {
-                pool_id: state.pool_id,
-                tick_spacing: state.tick_spacing,
-                tick_data,
-                tick_bitmap,
-                last_event: None,
-            };
-            let provider = handle.block_on(AlloyProvider::new(rpc_url, 5))?;
-            let fut = verify_v4_liquidity_map_on_chain(
-                &provider,
-                pool_manager,
-                pool_id,
-                &computed,
-                block_number,
-            );
-            tokio::task::block_in_place(|| handle.block_on(fut))
+            let request = catalog_tick_map_request(
+                &conn,
+                chain_id,
+                LiquidityMapTarget::V4 {
+                    pool_manager,
+                    pool_id,
+                },
+            )?;
+            drop(conn);
+            let chain = u64::try_from(chain_id).map_err(|_| {
+                RunError::Db(degenbot_db::DbError::Decode("invalid chain_id".into()))
+            })?;
+            tokio::task::block_in_place(|| {
+                handle.block_on(async {
+                    let provider = AlloyProvider::for_chain(rpc_url, chain, 5).await?;
+                    verify_tick_map_snapshot(&provider, request, block_number).await
+                })
+            })
         })
         .map_err(run_err_to_py)?;
 
@@ -511,7 +462,7 @@ mod tests {
         });
     }
 
-    /// `update_report_to_dict` produces the six-key report dict the `.pyi`
+    /// `update_report_to_dict` produces the five-key report dict the `.pyi`
     /// contract promises (the `run_pool_update` return shape).
     #[test]
     fn update_report_dict_shape() {
@@ -522,7 +473,6 @@ mod tests {
                 to_block: 99,
                 chunks_committed: 3,
                 total_pools_written: 7,
-                total_liquidity_applies: 4,
             };
             let d = update_report_to_dict(py, &r).unwrap();
             let bound = d.bind(py);
@@ -532,7 +482,6 @@ mod tests {
                 "to_block",
                 "chunks_committed",
                 "total_pools_written",
-                "total_liquidity_applies",
             ] {
                 assert!(bound.contains(k).unwrap(), "missing key {k}");
             }

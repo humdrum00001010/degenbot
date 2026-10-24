@@ -451,6 +451,7 @@ fn state_at_tick_zero(liq: u128, tick_spacing: i32) -> V3PoolState {
         update_block: 0,
         tick_data_block: 0,
         initial_state_block: 0,
+        initial_tick_data_block: Some(0),
         tick_data,
         snapshot_seed: None,
         post_drain_snapshot: None,

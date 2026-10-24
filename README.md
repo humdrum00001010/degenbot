@@ -1272,10 +1272,8 @@ degenbot database heal [--dry-run]
 #### Pool State Management
 
 ```bash
-# Update pool metadata and liquidity positions for all active exchanges
-# (--verify-chunk/--verify-all add pre-commit on-chain-truth gates: a
-# divergence rolls the chunk back and does NOT advance last_update_block)
-degenbot pool update [--chunk SIZE] [--to-block BLOCK] [--verify-chunk/--no-verify-chunk] [--verify-all/--no-verify-all]
+# Discover pools and update the catalog for all active exchanges
+degenbot pool update [--chunk SIZE] [--to-block BLOCK]
 
 # Verify one V3/V4 pool's DB state against on-chain truth at a given block
 degenbot pool verify --rpc-url URL --chain 1 --block 18900000 --pool 0x... --family v3|v4 [--pool-manager 0x...]
@@ -1291,6 +1289,11 @@ degenbot exchange deactivate --chain base --name uniswap_v3
 degenbot path add --socket /path/to/operator.sock --hop V2:0xPoolAddr [--hop V3:0xPoolAddr] [--direction zfo|ozf]
 degenbot path discover --socket /path/to/operator.sock [--bound N]
 ```
+
+`pool update` records discovered pool identities and metadata; it does not
+reconstruct concentrated-liquidity maps. Bot pool initialization reads a
+complete block-pinned snapshot through Erigon's `erigon_getTickMaps` method;
+see [the tick-map architecture](docs/architecture/erigon-tick-maps.md).
 
 **Supported exchanges** (`--chain <chain> --name <dex>`):
 - Base: `aerodrome_v2`, `aerodrome_v3`, `pancakeswap_v2`, `pancakeswap_v3`, `sushiswap_v2`, `sushiswap_v3`, `swapbased_v2`, `uniswap_v2`, `uniswap_v3`, `uniswap_v4`

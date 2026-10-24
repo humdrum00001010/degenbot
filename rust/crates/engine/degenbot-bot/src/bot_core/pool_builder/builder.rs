@@ -13,14 +13,13 @@
 //! `cargo add degenbot` consumer reaches [`build_v2`] via the `degenbot`
 //! umbrella (Tier-0 slice in `examples/standalone_consumer.rs`).
 
-use hashbrown::HashMap;
 use std::sync::Arc;
 
+use alloy::eips::{BlockId, RpcBlockHash};
 use alloy::primitives::{Address, B256, U256};
 use degenbot_core::address_utils::address_to_checksum_string;
 use degenbot_core::errors::ProviderError;
 use degenbot_db::error::DbError;
-use degenbot_db::snapshot::TickMapDb;
 use degenbot_pools::aerodrome_v2_state::RegisterAerodromeV2PoolParams;
 use degenbot_pools::balancer_stable_state::RegisterBalancerStablePoolParams;
 use degenbot_pools::balancer_weighted_state::RegisterBalancerWeightedPoolParams;
@@ -35,6 +34,7 @@ use degenbot_pools::{
     BalanceVectorVariant, ConcentratedLiquidityVariant, Identity, ReservePairVariant,
 };
 use degenbot_rpc::abi;
+use degenbot_rpc::tick_snapshot::{PoolTickSnapshot, TickMapProtocol, TickMapRequest};
 use degenbot_uniswap::deployments;
 use degenbot_uniswap::dex_identity::{self, DexIdentity, DexVariant};
 
@@ -42,9 +42,7 @@ use super::choreography::{self};
 use super::curve_choreography;
 use crate::bot_core::construction_io::ConstructionIo;
 use crate::bot_core::curve_data_provider_impl::RpcCurveDataProvider;
-use crate::bot_core::{PoolTickCoverage, TickInfo};
-use degenbot_substrate::planning::{TickMapPoolIdentity, TickMapSeed};
-use degenbot_substrate::tick_assembly::{chain_arm, resolve_tick_map_arm};
+use crate::bot_core::PoolTickCoverage;
 
 /// The on-chain family a `probe` resolves to (V4 is a separate
 /// `(PoolManager, pool_id)` path, not a single-address probe).
@@ -110,11 +108,6 @@ pub enum PoolBuilderError {
     Db(#[from] DbError),
     #[error("V4 identity incomplete: {message}")]
     MissingIdentity { message: String },
-    /// A Tracked Db snapshot failed the intake reconciliation:
-    /// the bitmap and tick rows contradict each other. Registration is
-    /// rejected with a typed error; the message names the conflict.
-    #[error("tick map assembly failure: {0}")]
-    TickAssembly(#[from] degenbot_substrate::tick_assembly::TickMapAssemblyError),
 }
 
 /// Sentinels returned when an ERC-20 metadata field cannot be resolved,
@@ -813,161 +806,6 @@ pub async fn build_balancer_stable(
     })
 }
 
-/// Assemble a V3 pool's tick map with **DB-first** coverage.
-///
-/// The Db arm routes through the shared
-/// [`resolve_tick_map_arm`](degenbot_substrate::tick_assembly::resolve_tick_map_arm)
-/// (so the `Tracked`/`Sparse` precedence, the Tracked intake reconciliation,
-/// and the Db-empty semantics are identical to
-/// `tick_assembly::assemble_v3_tick_map`), then runs the async-native Chain
-/// transport only on a Db miss. This module's `bootstrap_v3_tick_map` is the
-/// builder's own Chain adapter: it cannot `block_on` the sync
-/// [`TickBootstrapRpc`] trait object from the async registration runtime (the
-/// nested-`block_on` deadlock class). Both arms mint through the shared
-/// [`chain_arm`](degenbot_substrate::tick_assembly::chain_arm) /
-/// `resolve_tick_map_arm` seed vocabulary.
-///
-/// # Errors
-///
-/// Returns [`PoolBuilderError::Db`] on a DB read failure,
-/// [`PoolBuilderError::TickAssembly`] on a self-contradictory Tracked map, or
-/// [`PoolBuilderError::Rpc`] on a Chain-arm failure.
-async fn assemble_db_or_chain_v3(
-    db: Option<&dyn TickMapDb>,
-    io: &ConstructionIo,
-    address: Address,
-    tick: i32,
-    tick_spacing: i32,
-    block: u64,
-) -> Result<TickMapSeed, PoolBuilderError> {
-    let db_arm = resolve_tick_map_arm::<PoolBuilderError, _>(
-        &format!("{address}"),
-        TickMapPoolIdentity::V3(address),
-        tick_spacing,
-        block,
-        || match db {
-            Some(db) => db
-                .fetch_liquidity_map(address)
-                .map_err(PoolBuilderError::Db),
-            None => Ok(None),
-        },
-    )?;
-    if let Some(seed) = db_arm {
-        return Ok(seed);
-    }
-    // DB miss -> Chain arm (Sparse).
-    let (ticks, bitmap) = bootstrap_v3_tick_map(io, address, tick, tick_spacing, block)
-        .await
-        .map_err(PoolBuilderError::Rpc)?;
-    let (word, _) =
-        degenbot_math::cl::liquidity_mapping::get_tick_word_and_bit_position(tick, tick_spacing);
-    Ok(chain_arm(Some(ticks), HashMap::from([(word, bitmap)]))
-        .into_seed(block, TickMapPoolIdentity::V3(address)))
-}
-
-/// V4 twin of [`assemble_db_or_chain_v3`]: the shared Db arm over
-/// `TickMapDb.fetch_liquidity_map_v4`, then the async V4 Chain transport on a
-/// miss. Same semantics — see [`assemble_db_or_chain_v3`].
-#[expect(clippy::too_many_arguments)]
-async fn assemble_db_or_chain_v4(
-    db: Option<&dyn TickMapDb>,
-    io: &ConstructionIo,
-    pool_manager: Address,
-    state_view: Address,
-    pool_id: [u8; 32],
-    tick: i32,
-    tick_spacing: i32,
-    block: u64,
-) -> Result<TickMapSeed, PoolBuilderError> {
-    let db_arm = resolve_tick_map_arm::<PoolBuilderError, _>(
-        &alloy::hex::encode_prefixed(pool_id),
-        TickMapPoolIdentity::V4 {
-            manager: pool_manager,
-            pool_id: B256::from(pool_id),
-        },
-        tick_spacing,
-        block,
-        || match db {
-            Some(db) => db
-                .fetch_liquidity_map_v4(pool_manager, B256::from(pool_id))
-                .map_err(PoolBuilderError::Db),
-            None => Ok(None),
-        },
-    )?;
-    if let Some(seed) = db_arm {
-        return Ok(seed);
-    }
-    // DB miss -> Chain arm (Sparse).
-    let (ticks, bitmap) = bootstrap_v4_tick_map(io, state_view, pool_id, tick, tick_spacing, block)
-        .await
-        .map_err(PoolBuilderError::Rpc)?;
-    let (word, _) =
-        degenbot_math::cl::liquidity_mapping::get_tick_word_and_bit_position(tick, tick_spacing);
-    Ok(
-        chain_arm(Some(ticks), HashMap::from([(word, bitmap)])).into_seed(
-            block,
-            TickMapPoolIdentity::V4 {
-                manager: pool_manager,
-                pool_id: B256::from(pool_id),
-            },
-        ),
-    )
-}
-
-/// Chain-arm single-word tick bootstrap over [`ConstructionIo`] — the V3
-/// portion of `assemble_v3_tick_map`'s Chain arm, inlined over the generic RPC
-/// primitive so a bare `ConstructionIo` (no `TickBootstrapRpc`/db) can seed a
-/// Sparse pool. Mirrors `AlloyTickBootstrapRpc::bootstrap_v3_tick_word` and
-/// the Python Branch 3 loop verbatim: compute the word, read `tickBitmap`, on a
-/// non-zero bitmap enumerate the 256 set bits and read each tick's
-/// `ticks(int24)` liquidity.
-///
-/// Coverage is always [`PoolTickCoverage::Sparse`] (only the single current
-/// word is seeded), so the pool is **live immediately** (decision D4) and the
-/// live-pump miss-detection backfills neighbour words during swap simulation.
-async fn bootstrap_v3_tick_map(
-    io: &ConstructionIo,
-    address: Address,
-    tick: i32,
-    tick_spacing: i32,
-    block: u64,
-) -> Result<(HashMap<i32, TickInfo>, U256), ProviderError> {
-    let (word, _) =
-        degenbot_math::cl::liquidity_mapping::get_tick_word_and_bit_position(tick, tick_spacing);
-    #[expect(clippy::expect_used)] // invariant-guarded (documented)
-    let word_i16 = i16::try_from(word).expect("V3 tick word fits in int16");
-    // Best-effort single-word probe for a Sparse pool: an unreadable word
-    // (decode error on a provider that can't serve `tickBitmap`) degrades to
-    // an empty word → empty ticks → Sparse, preserving the legacy builder's
-    // graceful fallback (`tick_data=None, coverage=sparse`). Only the
-    // mis-shaped-response decode error is tolerated; genuine transport/network
-    // failures still propagate.
-    let bitmap = match choreography::fetch_tick_bitmap(io, address, word_i16, Some(block)).await {
-        Ok(b) => b,
-        Err(degenbot_core::errors::ProviderError::DecodingError { .. }) => U256::ZERO,
-        Err(e) => return Err(e),
-    };
-
-    let mut ticks = HashMap::new();
-    for i in 0..=255u8 {
-        if bitmap.bit(i.into()) {
-            let active_tick = ((word << 8) + i32::from(i)) * tick_spacing;
-            let (liquidity_gross, liquidity_net) =
-                choreography::fetch_tick_data(io, address, active_tick, Some(block)).await?;
-            ticks.insert(
-                active_tick,
-                TickInfo {
-                    liquidity_gross,
-                    liquidity_net,
-                    block,
-                },
-            );
-        }
-    }
-
-    Ok((ticks, bitmap))
-}
-
 /// Assemble `build_curve_pool` params for a Curve `StableSwap` pool (the task
 /// assembly twin of `CurvePoolBuilder.build`):
 /// discovers coins/balances, fetches `A`/`fee`/`admin_fee`, detects A-ramping,
@@ -1121,11 +959,8 @@ async fn fetch_erc20_decimals(
 
 /// Assemble `build_v3` params for a concentrated-liquidity (V3-style) pool.
 ///
-/// Reads immutable data (`factory()`/`token0()`/`token1()`/`fee()`/
-/// `tickSpacing()`), `slot0()` + `liquidity()`, seeds a Sparse tick map via the
-/// Chain-arm bootstrap, verifies the CREATE2 address, and resolves deployment
-/// deployer/`init_hash` — producing a [`RegisterV3PoolParams`] ready for
-/// `BotState::register_v3_pool` with no Python round-trip.
+/// Reads immutable identity, verifies its CREATE2 address, and loads scalars
+/// and ticks from a complete Erigon snapshot at one canonical block.
 ///
 /// # Errors
 ///
@@ -1134,38 +969,38 @@ async fn fetch_erc20_decimals(
 pub async fn build_v3(
     chain_id: u64,
     address: Address,
-    db: Option<&dyn TickMapDb>,
     io: &ConstructionIo,
     block: Option<u64>,
+    slot_layout: Option<ClSlotLayout>,
 ) -> Result<RegisterV3PoolParams, PoolBuilderError> {
+    let pinned = pin_tick_map_block(io, block).await?;
+    let block = Some(pinned.0);
     let imm = choreography::fetch_v3_immutable_data(io, address, block).await?;
-    let (sqrt_price_x96, tick_i, liquidity) =
-        choreography::fetch_v3_slot0_liquidity(io, address, block).await?;
-    let tick = i32::try_from(tick_i).unwrap_or(0);
-    let update_block = block.unwrap_or(0);
+    let slot_layout = slot_layout.unwrap_or_else(|| {
+        if deployments::is_pancakeswap_v3_factory(chain_id, imm.factory) {
+            ClSlotLayout::PancakeV3
+        } else {
+            ClSlotLayout::UniswapV3
+        }
+    });
+    let update_block = pinned.0;
+    let snapshot = load_tick_map(
+        io,
+        TickMapRequest {
+            address,
+            tick_spacing: imm.tick_spacing,
+            pool_id: None,
+            protocol: match slot_layout {
+                ClSlotLayout::UniswapV3 => TickMapProtocol::UniswapV3,
+                ClSlotLayout::PancakeV3 => TickMapProtocol::PancakeV3,
+            },
+        },
+        pinned,
+        Some(chain_id),
+    )
+    .await?;
 
-    let seed =
-        assemble_db_or_chain_v3(db, io, address, tick, imm.tick_spacing, update_block).await?;
-    let coverage = seed.coverage;
-    let tick_data = seed.ticks;
-    // Two-stamp rule (regression 8c50e0cd): the PRICE clock
-    // (`update_block`) stays at the fresh caller-supplied head read, but the
-    // LIQUIDITY clock (`tick_data_block`) of a DB-seeded (`Tracked`) pool must
-    // be the block its DB liquidity map is EXACT at (`liquidity_update_block`),
-    // not the head — otherwise the seed/post-drain verify compares stale seed
-    // data against on-chain at head and false-positives on every tick that
-    // moved in the `(liquidity_update_block, head]` window. Sparse (Chain-
-    // seeded) pools keep the head clock. Falls back to `update_block` when the
-    // DB block is unavailable/zero.
-    let tick_data_block = if coverage == PoolTickCoverage::Tracked {
-        db.and_then(|d| d.fetch_liquidity_update_block(address).ok().flatten())
-            .and_then(|b| u64::try_from(b).ok())
-            .filter(|b| *b > 0)
-            .unwrap_or(update_block)
-    } else {
-        update_block
-    };
-
+    let tick_data = snapshot.tick_map(pinned.0);
     deployments::verify_v3_pool_address(
         chain_id,
         imm.factory,
@@ -1178,15 +1013,6 @@ pub async fn build_v3(
 
     let deployer = deployments::resolve_deployer(chain_id, imm.factory);
     let init_hash: B256 = deployments::resolve_v3_init_hash(chain_id, imm.factory);
-    // Family-aware slot layout: the Pancake V3 fork's
-    // divergent storage layout (liquidity@5, ticks@6) — resolved from the
-    // deployment table; the FFI layer can override for non-JSON pools.
-    let slot_layout = if deployments::is_pancakeswap_v3_factory(chain_id, imm.factory) {
-        ClSlotLayout::PancakeV3
-    } else {
-        ClSlotLayout::UniswapV3
-    };
-
     Ok(RegisterV3PoolParams {
         address,
         token0: imm.token0,
@@ -1194,13 +1020,13 @@ pub async fn build_v3(
         fee: imm.fee,
         tick_spacing: imm.tick_spacing,
         factory: imm.factory,
-        sqrt_price_x96,
-        liquidity: liquidity.to::<u128>(),
-        tick,
+        sqrt_price_x96: snapshot.sqrt_price_x96,
+        liquidity: snapshot.liquidity,
+        tick: snapshot.tick,
         tick_data,
         update_block,
-        tick_data_block: Some(tick_data_block),
-        coverage,
+        tick_data_block: Some(update_block),
+        coverage: PoolTickCoverage::Tracked,
         fetcher: None,
         deployer,
         init_hash,
@@ -1208,55 +1034,54 @@ pub async fn build_v3(
     })
 }
 
-/// Chain-arm single-word tick bootstrap over [`ConstructionIo`] for a V4 pool
-/// identified by (`pool_manager`, `pool_id`) — the V4 twin of
-/// [`bootstrap_v3_tick_map`]. Reads the bitmap via `getTickBitmap(bytes32,
-/// int16)` and each set tick's liquidity via `getTickLiquidity(bytes32,
-/// int24)` on the `pool_manager` (which exposes the same state-view getters);
-/// coverage is always [`PoolTickCoverage::Sparse`] so the pool is live
-/// immediately (D4).
-async fn bootstrap_v4_tick_map(
+async fn pin_tick_map_block(
     io: &ConstructionIo,
-    state_view: Address,
-    pool_id: [u8; 32],
-    tick: i32,
-    tick_spacing: i32,
-    block: u64,
-) -> Result<(HashMap<i32, TickInfo>, U256), ProviderError> {
-    let (word, _) =
-        degenbot_math::cl::liquidity_mapping::get_tick_word_and_bit_position(tick, tick_spacing);
-    #[expect(clippy::expect_used)] // invariant-guarded (documented)
-    let word_i16 = i16::try_from(word).expect("V4 tick word fits in int16");
-    // Same best-effort single-word probe + graceful decode-error degradation as
-    // the V3 arm (`bootstrap_v3_tick_map`): an unreadable word → empty/Sparse.
-    let bitmap =
-        match choreography::fetch_v4_tick_bitmap(io, state_view, pool_id, word_i16, Some(block))
-            .await
-        {
-            Ok(b) => b,
-            Err(degenbot_core::errors::ProviderError::DecodingError { .. }) => U256::ZERO,
-            Err(e) => return Err(e),
-        };
-
-    let mut ticks = HashMap::new();
-    for i in 0..=255u8 {
-        if bitmap.bit(i.into()) {
-            let active_tick = ((word << 8) + i32::from(i)) * tick_spacing;
-            let (liquidity_gross, liquidity_net) =
-                choreography::fetch_v4_tick_data(io, state_view, pool_id, active_tick, Some(block))
-                    .await?;
-            ticks.insert(
-                active_tick,
-                TickInfo {
-                    liquidity_gross,
-                    liquidity_net,
-                    block,
-                },
-            );
-        }
+    block: Option<u64>,
+) -> Result<(u64, B256), ProviderError> {
+    let number = match block {
+        Some(number) => number,
+        None => io.get_block_number().await?,
+    };
+    let header = io
+        .get_block(number)
+        .await?
+        .ok_or_else(|| ProviderError::InvalidResponse {
+            message: "tick map snapshot block is unavailable".into(),
+        })?
+        .header;
+    if header.number != number || header.hash == B256::ZERO {
+        return Err(ProviderError::InvalidResponse {
+            message: "tick map snapshot header does not match requested block".into(),
+        });
     }
+    Ok((number, header.hash))
+}
 
-    Ok((ticks, bitmap))
+async fn load_tick_map(
+    io: &ConstructionIo,
+    request: TickMapRequest,
+    (number, hash): (u64, B256),
+    chain_id: Option<u64>,
+) -> Result<PoolTickSnapshot, ProviderError> {
+    let block = BlockId::Hash(RpcBlockHash {
+        block_hash: hash,
+        require_canonical: Some(true),
+    });
+    let snapshot = io.get_tick_maps(&[request], block).await?;
+    snapshot.validate(&[request], block)?;
+    if snapshot.block_number != number || chain_id.is_some_and(|chain| chain != snapshot.chain_id) {
+        return Err(ProviderError::InvalidResponse {
+            message: "tick map snapshot does not match pinned chain, block, or pool count".into(),
+        });
+    }
+    let pool = snapshot
+        .pools
+        .into_iter()
+        .next()
+        .ok_or_else(|| ProviderError::InvalidResponse {
+            message: "tick map snapshot omitted requested pool".into(),
+        })?;
+    Ok(pool)
 }
 
 /// Caller-supplied V4 pool identity (mirrors the `register_v4_pool` argument
@@ -1293,12 +1118,12 @@ pub struct V4PoolBuildIdentity {
 }
 
 /// The complete result of a V4 pool build: the registration params plus the
-/// LP-fee pip decoded from the same head-stamped slot0 read.
+/// LP-fee pip decoded from the same scalar snapshot.
 ///
 /// ``lp_fee`` is exposed here (rather than bloat
 /// [`RegisterV4PoolParams`] with a field the engine/solver does not consume)
 /// so the Python companion can set its ``lp_fee`` override from the builder's
-/// own slot0 read instead of issuing a second, redundant ``fetch_v4_slot0_liquidity``
+/// own scalar snapshot instead of issuing a redundant ``fetch_v4_slot0_liquidity``
 /// round-trip. ``protocol_fee`` already rides inside
 /// [`RegisterV4PoolParams::protocol_fee`] (the raw 24-bit word; the companion
 /// splits it into zero-for-one / one-for-zero). Same head stamp, no second read.
@@ -1306,7 +1131,7 @@ pub struct V4PoolBuildIdentity {
 pub struct V4BuildResult {
     /// Registration params (incl. ``protocol_fee``) fed to the shared `BotState`.
     pub params: RegisterV4PoolParams,
-    /// The LP-fee pip (``lp_fee``/1e6) decoded from the head-stamped slot0 word.
+    /// The LP-fee pip (``lp_fee``/1e6) from the scalar snapshot.
     pub lp_fee: u32,
 }
 
@@ -1317,55 +1142,32 @@ pub struct V4BuildResult {
 /// `getToken0`/`getHooks`/`getHookFlags` on-chain (mirroring the existing
 /// `register_v4_pool`, which takes `currency0`/`currency1`/`fee`/`tick_spacing`/
 /// `hook_flags` as arguments; hook filtering is already applied via
-/// `hook_flags`). This reads only the live scalars (`getSlot0` +
-/// `getLiquidity` on the `pool_manager`) and seeds a Sparse tick map via the
-/// Chain-arm bootstrap — reusing the existing StateView-backed choreography
-/// with no new ABI.
+/// `hook_flags`). Erigon supplies scalars and the complete map from manager
+/// storage at one canonical block.
 ///
 /// # Errors
 ///
 /// Returns a [`ProviderError`] on an RPC/decode failure.
 pub async fn build_v4(
     id: V4PoolBuildIdentity,
-    db: Option<&dyn TickMapDb>,
     io: &ConstructionIo,
     block: Option<u64>,
 ) -> Result<V4BuildResult, PoolBuilderError> {
-    let (sqrt_price_x96, tick_i, protocol_fee_u, lp_fee_u, liquidity_u) =
-        choreography::fetch_v4_slot0_liquidity(io, id.state_view, id.pool_id, block).await?;
-    let protocol_fee = protocol_fee_u.to::<u32>();
-    let lp_fee = lp_fee_u.to::<u32>();
-    let tick = i32::try_from(tick_i).unwrap_or(0);
-    let update_block = block.unwrap_or(0);
-
-    let seed = assemble_db_or_chain_v4(
-        db,
+    let pinned = pin_tick_map_block(io, block).await?;
+    let update_block = pinned.0;
+    let snapshot = load_tick_map(
         io,
-        id.pool_manager,
-        id.state_view,
-        id.pool_id,
-        tick,
-        id.tick_spacing,
-        update_block,
+        TickMapRequest {
+            address: id.pool_manager,
+            protocol: TickMapProtocol::UniswapV4,
+            pool_id: Some(id.pool_id.into()),
+            tick_spacing: id.tick_spacing,
+        },
+        pinned,
+        None,
     )
     .await?;
-    let coverage = seed.coverage;
-    let tick_data = seed.ticks;
-    // Two-stamp rule (V4 twin of build_v3): a DB-seeded (`Tracked`) pool's
-    // liquidity clock is its DB `liquidity_update_block`, not the head price
-    // clock (regression 8c50e0cd).
-    let tick_data_block = if coverage == PoolTickCoverage::Tracked {
-        db.and_then(|d| {
-            d.fetch_liquidity_update_block_v4(id.pool_manager, B256::from(id.pool_id))
-                .ok()
-                .flatten()
-        })
-        .and_then(|b| u64::try_from(b).ok())
-        .filter(|b| *b > 0)
-        .unwrap_or(update_block)
-    } else {
-        update_block
-    };
+    let tick_data = snapshot.tick_map(update_block);
 
     Ok(V4BuildResult {
         params: RegisterV4PoolParams {
@@ -1383,17 +1185,17 @@ pub async fn build_v4(
                 hooks: id.hook_address,
             },
             hook_flags: derive_hook_flags(id.hook_address),
-            protocol_fee,
-            sqrt_price_x96,
-            liquidity: liquidity_u.to::<u128>(),
-            tick,
+            protocol_fee: snapshot.protocol_fee,
+            sqrt_price_x96: snapshot.sqrt_price_x96,
+            liquidity: snapshot.liquidity,
+            tick: snapshot.tick,
             tick_data,
             update_block,
-            tick_data_block: Some(tick_data_block),
-            coverage,
+            tick_data_block: Some(update_block),
+            coverage: PoolTickCoverage::Tracked,
             fetcher: None,
         },
-        lp_fee,
+        lp_fee: snapshot.lp_fee,
     })
 }
 
@@ -1424,10 +1226,6 @@ pub struct V4PoolBuildOverrides {
 /// Resolve the V4 identity **core-side**: the DB two-step
 /// (manager → V4 row → per-FK token rows) first, else the caller-supplied
 /// [`V4PoolBuildOverrides`]. Returns the resolved [`V4PoolBuildIdentity`].
-///
-/// (The Rust `build_v4` reads `liquidity_update_block` itself via
-/// `TickMapDb::fetch_liquidity_update_block_v4` to stamp the liquidity
-/// clock; the driver no longer needs it.)
 ///
 /// DB errors and partial rows are treated as "no DB identity" (matching the
 /// retired Python driver's `contextlib.suppress(Exception)`), falling through

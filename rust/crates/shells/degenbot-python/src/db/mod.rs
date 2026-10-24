@@ -13,7 +13,6 @@ pub mod aave;
 #[cfg(feature = "aave-updater")]
 pub mod aave_analysis;
 pub mod discovery;
-pub mod liquidity_updater;
 pub mod pool_read;
 pub mod read_seams;
 pub mod snapshot;
@@ -27,7 +26,6 @@ use pyo3::types::PyDict;
 pub use aave::PyDatabasePositionQuery;
 use degenbot_db::ops::{self, UpgradeOutcome};
 use degenbot_db::schema::RUST_SCHEMA_VERSION;
-pub use liquidity_updater::PyLiquidityUpdateEvent;
 pub use pool_read::{PyExchangeRow, PyLiquidityPoolRow, PyPoolManagerRow};
 pub use snapshot::PyDatabaseSnapshot;
 
@@ -159,26 +157,6 @@ fn schema_state_label(state: &degenbot_db::SchemaState) -> &'static str {
     }
 }
 
-/// Map a [`degenbot_substrate::tick_assembly::TickMapAssemblyError`] to a
-/// Python exception.
-///
-/// - `Db` variant → delegates to [`db_err_to_py`] (a `ValueError`).
-/// - `Chain` variant → `RuntimeError` (Decision 8 (A) loud-failure posture —
-///   RPC failures surface as a typed exception, not swallowed into a silent
-///   degrade-to-sparse path).
-pub(crate) fn assembly_err_to_py(
-    err: &degenbot_substrate::tick_assembly::TickMapAssemblyError,
-) -> PyErr {
-    use degenbot_substrate::tick_assembly::TickMapAssemblyError;
-    match err {
-        TickMapAssemblyError::Db(e) => db_err_to_py(e),
-        TickMapAssemblyError::Chain(e) => pyo3::exceptions::PyRuntimeError::new_err(e.to_string()),
-        TickMapAssemblyError::InconsistentTickMap { .. } => {
-            pyo3::exceptions::PyValueError::new_err(err.to_string())
-        }
-    }
-}
-
 /// Map a [`degenbot_db::DbError`] to a Python exception.
 ///
 /// Every variant maps to a generic `ValueError` (the degenbot Python layer's
@@ -206,12 +184,6 @@ pub mod db {
     use super::{
         db_backup_database, db_compact_database, db_heal_database, db_inspect_schema_state,
         db_schema_version, db_upgrade_database,
-    };
-
-    // Liquidity-updater write path.
-    #[pymodule_export]
-    use super::liquidity_updater::{
-        db_apply_v3_liquidity_updates, db_apply_v4_liquidity_updates, PyLiquidityUpdateEvent,
     };
 
     // Pool/exchange read rows.

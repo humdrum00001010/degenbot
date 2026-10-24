@@ -20,7 +20,6 @@
 
 use std::sync::Arc;
 
-use crate::bot_core::snapshot_verify::SnapshotLoadError;
 use degenbot_substrate::session_registry::SessionObjectRegistry;
 use degenbot_substrate::state_lock::StateLock;
 use degenbot_substrate::EpochDelta;
@@ -28,7 +27,7 @@ use degenbot_substrate::{log_dispatcher, BotState};
 
 // The lifecycle cluster's typed errors — re-exported from here so the
 // shell's `degenbot_bot::bot_core::bot::*Error` import paths hold.
-pub use crate::bot_core::lifecycle::{BlockStreamError, CloseSnapshotTxError, SnapshotOpenError};
+pub use crate::bot_core::lifecycle::BlockStreamError;
 
 /// The per-chain orchestrator: a thin facade over a shared
 /// [`BotState`] (the pure-data registries/swap math/reorg journal) plus the
@@ -205,59 +204,12 @@ impl Bot {
         Arc::clone(&self.registry)
     }
 
-    /// Record the snapshot seed block `S` on `BotState` from a held-tx DB
-    /// handle. The single entry point a standalone Rust
-    /// consumer and the pyo3 `PyBot` constructor both call.
-    ///
-    /// `db` is a [`degenbot_db::snapshot::TickMapDb`] — typically a
-    /// [`degenbot_db::snapshot_db::SnapshotDb`] opened with a held deferred
-    /// read transaction so `S` + every per-pool `fetch_liquidity_map` read
-    /// share one frozen DB snapshot across `build_paths` (the consistency
-    /// replacement for the retired `SnapshotStore`).
-    ///
-    /// Records `S = min(fetch_newest_update_block(V3), V4)`. `None`
-    /// for a family with no pools / NULL `last_update_block`; if BOTH families
-    /// are `None`, `S` is `None` (cold-start path — the pump anchors on
-    /// `first_observed_block`, no snapshot gap to backfill).
-    ///
-    /// # Errors
-    ///
-    /// Returns [`SnapshotLoadError::Db`] on a DB read failure.
-    ///
-    /// # Panics
-    ///
-    /// Panics if a `fetch_newest_update_block` returns a negative block number
-    /// (invalid DB state — `SQLite` stores block numbers as signed `i64`, but
-    /// on-chain block numbers are non-negative).
-    pub fn load_snapshot_from_db(
-        &self,
-        db: &dyn degenbot_db::snapshot::TickMapDb,
-        chain_id: u64,
-    ) -> Result<(), SnapshotLoadError> {
-        let chain = i64::try_from(chain_id)
-            .map_err(|_| SnapshotLoadError::Range(format!("chain_id {chain_id} exceeds i64")))?;
-        let mut state = self
-            .state
-            .write_at(degenbot_substrate::state_lock::LockSite::Orchestrator);
-        let now_v3 = db
-            .fetch_newest_update_block(chain, degenbot_db::read::ExchangeFamily::V3)
-            .map_err(SnapshotLoadError::from)?;
-        let now_v4 = db
-            .fetch_newest_update_block(chain, degenbot_db::read::ExchangeFamily::V4)
-            .map_err(SnapshotLoadError::from)?;
-        // S = min(fetch_newest_update_block(V3), V4), ignoring None families.
-        #[expect(clippy::expect_used)] // block numbers are non-negative (documented)
-        let s = match (state.snapshot_seed_block(), now_v3, now_v4) {
-            (None, Some(v3), Some(v4)) => {
-                Some(u64::try_from(v3.min(v4)).expect("block number non-negative"))
-            }
-            (None, Some(v3), None) => Some(u64::try_from(v3).expect("block number non-negative")),
-            (None, None, Some(v4)) => Some(u64::try_from(v4).expect("block number non-negative")),
-            (None, None, None) => None,
-            (existing, _, _) => existing,
-        };
-        state.set_snapshot_seed_block(s);
-        Ok(())
+    /// The earliest complete pool snapshot horizon available for pump replay.
+    #[must_use]
+    pub fn snapshot_seed_block(&self) -> Option<u64> {
+        self.state
+            .read_at(degenbot_substrate::state_lock::LockSite::Orchestrator)
+            .snapshot_seed_block()
     }
 
     /// Drive one WS log through the event bus (ADR-006 D4). Decode via a

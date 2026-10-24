@@ -325,19 +325,5 @@ class RunRitual:
             )
             host.trim()
         except asyncio.CancelledError:
-            # Registration is being torn down mid-flight (cancelled by the
-            # main loop's finally / a Ctrl-C / a fatal sim trap) BEFORE
-            # `build_paths` finished. Registration offloads
-            # `assemble_*_tick_map` (which clone the `Arc<SnapshotDb>`) onto a
-            # ThreadPoolExecutor; `path_builder`'s futures are NOT
-            # awaited/joined here, so worker threads may still be mid-
-            # `assemble` holding their clones. Running `close_snapshot_tx()`
-            # now would make the `Arc::try_unwrap` canary false-positive with
-            # a secondary RuntimeError that masks the real teardown reason.
-            # The WAL snapshot is a process-lifetime concern that becomes moot
-            # at exit, so skip the read-tx commit/canary and let the
-            # `Arc<SnapshotDb>` drop naturally with `Bot` — while the REST of
-            # the state trim still runs. The healthy path below keeps the
-            # canary fully active.
-            host.trim(close_read_tx=False)
+            host.trim()
             raise

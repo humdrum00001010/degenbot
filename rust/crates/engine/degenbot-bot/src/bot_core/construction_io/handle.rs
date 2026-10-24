@@ -11,6 +11,7 @@ use degenbot_db::rows::{
     V4PoolRow,
 };
 use degenbot_rpc::provider::EthBlock;
+use degenbot_rpc::tick_snapshot::{TickMapRequest, TickMapSnapshot};
 
 use super::{DbConstruction, RpcConstruction};
 
@@ -43,6 +44,14 @@ impl ConstructionIo {
 // is a one-line delegation so the trait dispatch stays in one place (the
 // `Arc<dyn …>` field), and callers don't repeat the `.db.` / `.rpc.` hop.
 impl ConstructionIo {
+    pub async fn get_tick_maps(
+        &self,
+        requests: &[TickMapRequest],
+        block: alloy::eips::BlockId,
+    ) -> Result<TickMapSnapshot, ProviderError> {
+        self.rpc.get_tick_maps(requests, block).await
+    }
+
     pub async fn fetch_erc20_token(
         &self,
         chain_id: i64,

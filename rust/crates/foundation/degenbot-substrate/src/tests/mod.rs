@@ -11,6 +11,7 @@ mod registration;
 mod session_path;
 mod session_position;
 mod session_registry;
+mod snapshot_horizons;
 mod snapshots;
 mod word_fetch;
 

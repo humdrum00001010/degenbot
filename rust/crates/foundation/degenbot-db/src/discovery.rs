@@ -28,11 +28,11 @@
 //! matching the Python `get_checksum_address` + the read seams
 //! ([`crate::read::DegenbotDb::fetch_pool_by_address`]).
 //!
-//! # Auto-commit (matches `liquidity_updater.rs`)
+//! # Auto-commit
 //!
 //! Each `INSERT`/`UPDATE` is auto-committed by `rusqlite` on the
 //! write-capable connection (the established pattern from
-//! [`crate::liquidity_updater`]); no explicit `BEGIN`/`COMMIT` wrapper.
+//! [`crate::tick_map_rows`]); no explicit `BEGIN`/`COMMIT` wrapper.
 
 use alloy::primitives::Address;
 use rusqlite::{params, OptionalExtension};

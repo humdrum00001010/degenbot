@@ -562,8 +562,7 @@ impl EngineDriver {
             .snapshot_seed_block()
     }
 
-    /// Store the snapshot seed block `S` on the shared core (the non-DB
-    /// snapshot path; the DB path sets it in `Bot::load_snapshot_from_db`).
+    /// Set the explicit replay anchor alongside complete per-pool horizons.
     pub fn set_snapshot_seed_block(&self, block: Option<u64>) {
         self.bot
             .state_arc()
@@ -747,14 +746,7 @@ impl EngineDriver {
         // race it. `backfill_with_drain` also re-injects live events
         // drained during the backfill ahead of the live tail.
         let (backfill_res, combined) = pump.backfill_with_drain(first_block, combined_stream).await;
-        if let Err(e) = backfill_res {
-            op_error!(
-                domain = pump,
-                first_block,
-                %e,
-                "EngineDriver: auto-backfill failed — starting live loop from gap (not closed)"
-            );
-        }
+        backfill_res.map_err(DriverError::Resume)?;
         // Arm the completion broadcast: the sender is owned by the spawned
         // task, so wherever the pump ends — cooperative return, stream end,
         // abort, or panic — the sender drops and every `wait_pump_finished`
@@ -953,11 +945,7 @@ impl EngineDriver {
     ///
     /// Propagates [`DriverError::Verify`] from the core lifecycle
     /// (`Mismatch` = fatal; `Rpc` = retryable; missing provider = fail-fast).
-    pub async fn run_v3_registration_lifecycle(
-        &self,
-        address: Address,
-        snapshot_block: Option<u64>,
-    ) -> Result<(), DriverError> {
+    pub async fn run_v3_registration_lifecycle(&self, address: Address) -> Result<(), DriverError> {
         let core = self.stages.core();
         let key = verify_claim_key("v3", &alloy::hex::encode_prefixed(address));
         if self.verifications.is_verified(&key) {
@@ -985,7 +973,6 @@ impl EngineDriver {
                     &core,
                     provider.as_ref(),
                     address,
-                    snapshot_block,
                 )
                 .instrument(lifecycle_span)
                 .await;
@@ -1013,7 +1000,6 @@ impl EngineDriver {
         &self,
         pool_manager: Address,
         pool_id: V4PoolId,
-        snapshot_block: Option<u64>,
     ) -> Result<(), DriverError> {
         let core = self.stages.core();
         let key = verify_claim_key(
@@ -1051,7 +1037,6 @@ impl EngineDriver {
                     provider.as_ref(),
                     pool_manager,
                     pool_id,
-                    snapshot_block,
                 )
                 .instrument(lifecycle_span)
                 .await;
@@ -1075,13 +1060,8 @@ impl EngineDriver {
     /// # Panics
     ///
     /// Panics if called from within a Tokio runtime.
-    pub fn run_v3_registration_lifecycle_sync(
-        &self,
-        address: Address,
-        snapshot_block: Option<u64>,
-    ) -> Result<(), DriverError> {
-        degenbot_core::runtime::get_runtime()
-            .block_on(self.run_v3_registration_lifecycle(address, snapshot_block))
+    pub fn run_v3_registration_lifecycle_sync(&self, address: Address) -> Result<(), DriverError> {
+        degenbot_core::runtime::get_runtime().block_on(self.run_v3_registration_lifecycle(address))
     }
 
     /// Blocking V4 registration lifecycle (the seat-thread twin).
@@ -1097,13 +1077,9 @@ impl EngineDriver {
         &self,
         pool_manager: Address,
         pool_id: V4PoolId,
-        snapshot_block: Option<u64>,
     ) -> Result<(), DriverError> {
-        degenbot_core::runtime::get_runtime().block_on(self.run_v4_registration_lifecycle(
-            pool_manager,
-            pool_id,
-            snapshot_block,
-        ))
+        degenbot_core::runtime::get_runtime()
+            .block_on(self.run_v4_registration_lifecycle(pool_manager, pool_id))
     }
 
     /// Run a V3 pool's registration verify lifecycle under the bounded retry
@@ -1122,11 +1098,10 @@ impl EngineDriver {
     pub async fn run_v3_registration_lifecycle_with_retry(
         &self,
         address: Address,
-        snapshot_block: Option<u64>,
         policy: &RetryPolicy,
     ) -> Result<(), VerifyError> {
         retry_verification_call(policy, |_attempt| async move {
-            self.run_v3_registration_lifecycle(address, snapshot_block)
+            self.run_v3_registration_lifecycle(address)
                 .await
                 .map_err(verify_error_from_driver)
         })
@@ -1142,11 +1117,10 @@ impl EngineDriver {
         &self,
         pool_manager: Address,
         pool_id: V4PoolId,
-        snapshot_block: Option<u64>,
         policy: &RetryPolicy,
     ) -> Result<(), VerifyError> {
         retry_verification_call(policy, |_attempt| async move {
-            self.run_v4_registration_lifecycle(pool_manager, pool_id, snapshot_block)
+            self.run_v4_registration_lifecycle(pool_manager, pool_id)
                 .await
                 .map_err(verify_error_from_driver)
         })
@@ -1165,12 +1139,10 @@ impl EngineDriver {
     pub fn run_v3_registration_lifecycle_with_retry_sync(
         &self,
         address: Address,
-        snapshot_block: Option<u64>,
         policy: &RetryPolicy,
     ) -> Result<(), VerifyError> {
-        degenbot_core::runtime::get_runtime().block_on(
-            self.run_v3_registration_lifecycle_with_retry(address, snapshot_block, policy),
-        )
+        degenbot_core::runtime::get_runtime()
+            .block_on(self.run_v3_registration_lifecycle_with_retry(address, policy))
     }
 
     /// Blocking V4 with-retry twin (the seat-thread shape).
@@ -1186,17 +1158,10 @@ impl EngineDriver {
         &self,
         pool_manager: Address,
         pool_id: V4PoolId,
-        snapshot_block: Option<u64>,
         policy: &RetryPolicy,
     ) -> Result<(), VerifyError> {
-        degenbot_core::runtime::get_runtime().block_on(
-            self.run_v4_registration_lifecycle_with_retry(
-                pool_manager,
-                pool_id,
-                snapshot_block,
-                policy,
-            ),
-        )
+        degenbot_core::runtime::get_runtime()
+            .block_on(self.run_v4_registration_lifecycle_with_retry(pool_manager, pool_id, policy))
     }
 
     /// Register a mixed path (DELEGATION, ADR-050 D4).
@@ -1795,6 +1760,49 @@ mod tests {
     }
 
     #[test]
+    fn failed_gap_replay_never_spawns_or_advances_phase_and_allows_resubscribe() {
+        use alloy::primitives::U256;
+        let driver = driver_for_test();
+        let _result_rx = driver.take_result_receiver();
+        driver
+            .bot()
+            .state_arc()
+            .write_at(LockSite::Pump)
+            .register_v3_pool(&degenbot_substrate::RegisterV3PoolParams {
+                address: Address::repeat_byte(0x44),
+                sqrt_price_x96: U256::from(1u128) << 96,
+                fee: 3000,
+                tick_spacing: 60,
+                coverage: PoolTickCoverage::Sparse,
+                ..Default::default()
+            })
+            .unwrap();
+        let pump = BlockPump::for_test(
+            Arc::clone(driver.bot()),
+            driver.stages().clone(),
+            driver.stages().clone(),
+            Arc::new(ReorgCoordinator::new(Arc::clone(driver.bot()))),
+            mock_provider(),
+            Arc::clone(&driver.shutdown),
+        );
+        driver.install_subscribe_state_for_test(DriverSubscribeState {
+            pump,
+            first_block: 100,
+            combined_stream: futures_util::stream::pending().boxed(),
+        });
+        driver.set_phase(PumpPhase::SnapshotLoaded);
+        let error = degenbot_core::runtime::get_runtime()
+            .block_on(driver.resume())
+            .unwrap_err();
+        assert!(matches!(error, DriverError::Resume(_)));
+        assert_eq!(driver.current_phase(), PumpPhase::SnapshotLoaded);
+        assert!(!driver.pump_handle_armed());
+        assert!(driver.subscribe_state.lock().is_none());
+        assert!(!driver.is_stopped());
+        driver.stop().unwrap();
+    }
+
+    #[test]
     fn wait_pump_finished_resolves_after_the_armed_pump_ends() {
         let driver = driver_for_test();
         let runtime = degenbot_core::runtime::get_runtime();
@@ -1983,7 +1991,7 @@ mod tests {
         let key = verify_claim_key("v3", &alloy::hex::encode_prefixed(address));
 
         driver
-            .run_v3_registration_lifecycle(address, None)
+            .run_v3_registration_lifecycle(address)
             .await
             .expect("first lifecycle");
         assert!(driver.is_pool_verified(&key), "success records the fact");
@@ -2002,7 +2010,7 @@ mod tests {
         register_v3(&driver, address, PoolTickCoverage::Tracked);
 
         driver
-            .run_v3_registration_lifecycle(address, None)
+            .run_v3_registration_lifecycle(address)
             .await
             .expect("a verified pool is not re-verified");
         assert_eq!(driver.verified_pool_count(), 1);
@@ -2053,10 +2061,7 @@ mod tests {
 
         for _ in 0..2 {
             assert!(
-                driver
-                    .run_v3_registration_lifecycle(address, None)
-                    .await
-                    .is_err(),
+                driver.run_v3_registration_lifecycle(address).await.is_err(),
                 "a tracked pool with no provider fails"
             );
             assert!(
@@ -2091,7 +2096,7 @@ mod tests {
         );
 
         driver
-            .run_v3_registration_lifecycle(shared_address, None)
+            .run_v3_registration_lifecycle(shared_address)
             .await
             .expect("V3 lifecycle");
         assert!(driver.is_pool_verified(&v3_key));
@@ -2101,7 +2106,7 @@ mod tests {
         );
 
         driver
-            .run_v4_registration_lifecycle(shared_address, sibling_id, None)
+            .run_v4_registration_lifecycle(shared_address, sibling_id)
             .await
             .expect("V4 lifecycle");
         assert!(driver.is_pool_verified(&v4_key));

@@ -4,13 +4,8 @@
 //!
 //! - `pool update` — the chunk-loop hand-off to
 //!   [`run_pool_update`](degenbot_pool_updater::run_pool_update), with the
-//!   `--chunk` / `--to-block` / `--verify-chunk` / `--verify-all` /
-//!   `--verify-all-interval` flags 1:1. Progress stays a no-op sink here
-//!   (ADR-051 D9: the bin paints it); a cooperative cancel returns a friendly
-//!   cancelled report (exit 0), matching the Python `RuntimeError` guard.
-//! - `pool verify` — the read-only, ad-hoc sibling: fetch the COMMITTED
-//!   liquidity map, compare against on-chain truth at `--block`, and render
-//!   GREEN / the named divergence list.
+//!   `--chunk` and `--to-block` control catalog discovery.
+//! - `pool verify` compares a block-pinned Erigon snapshot with ordinary getters.
 
 use std::future::Future;
 use std::path::Path;
@@ -18,13 +13,15 @@ use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use alloy::primitives::{Address, B256};
+use alloy::primitives::B256;
 use degenbot_core::runtime::get_runtime;
-use degenbot_db::{ComputedLiquidityUpdate, DegenbotDb};
+use degenbot_db::DegenbotDb;
 use degenbot_pool_updater::{
-    run_pool_update, verify_v3_liquidity_map_on_chain, verify_v4_liquidity_map_on_chain,
-    NoProgress, RunError,
+    catalog_tick_map_request, run_pool_update, verify_tick_map_snapshot, NoProgress, RunError,
 };
+
+use degenbot_rpc::liquidity_verifier::LiquidityMapTarget;
+use degenbot_rpc::tick_snapshot::TickMapRequest;
 
 use crate::block::{parse_to_block, resolve_to_block};
 use crate::cancel::CancelHandle;
@@ -65,14 +62,8 @@ pub enum PoolCommand {
         chunk_size: u64,
         /// The raw `--to-block` identifier (tag / tag:offset / integer).
         to_block: String,
-        /// Run the pre-commit per-chunk on-chain-truth gate.
-        verify_chunk: bool,
-        /// Run the pre-commit market-wide verification at the interval + completion.
-        verify_all: bool,
-        /// The block interval for the `--verify-all` gate.
-        verify_all_interval: u64,
     },
-    /// Verify a committed pool's liquidity map against on-chain truth.
+    /// Verify a pool's complete Erigon snapshot against on-chain truth.
     Verify {
         /// The HTTP RPC endpoint.
         rpc_url: String,
@@ -97,14 +88,6 @@ impl PoolCommand {
     }
 }
 
-/// The resolved verify target for a family.
-enum VerifyTarget {
-    /// A V3 pool contract address.
-    V3(Address),
-    /// A V4 `PoolManager` + `PoolId`.
-    V4 { manager: Address, pool_id: B256 },
-}
-
 /// Execute a `pool` command.
 ///
 /// # Errors
@@ -123,18 +106,7 @@ pub(crate) fn execute(
         PoolCommand::Update {
             chunk_size,
             to_block,
-            verify_chunk,
-            verify_all,
-            verify_all_interval,
-        } => update(
-            ctx,
-            cancel,
-            *chunk_size,
-            to_block,
-            *verify_chunk,
-            *verify_all,
-            *verify_all_interval,
-        ),
+        } => update(ctx, cancel, *chunk_size, to_block),
         PoolCommand::Verify {
             rpc_url,
             chain_id,
@@ -160,9 +132,6 @@ fn update(
     cancel: &CancelHandle,
     chunk_size: u64,
     to_block: &str,
-    verify_chunk: bool,
-    verify_all: bool,
-    verify_all_interval: u64,
 ) -> Result<PoolReport, CliError> {
     let database_path = ctx.database_path()?.value;
     let chain_id = ctx.chain_id()?.value;
@@ -173,11 +142,6 @@ fn update(
     let resolved = resolve_to_block(parse_to_block(to_block)?, &rpc_url)?;
     let chain = i64::try_from(chain_id)
         .map_err(|_| CliError::InvalidArgument(format!("chain id {chain_id} is out of range")))?;
-    let interval = if verify_all {
-        Some(verify_all_interval)
-    } else {
-        None
-    };
     // The pre-run resume snapshot, for the failure line's requested-range
     // bound: it mirrors the core's own `initial_start_block` (the minimum
     // `last_update_block + 1` across the active exchanges). Read-only, so a
@@ -202,9 +166,6 @@ fn update(
             provider,
             cancel.flag(),
             Arc::new(NoProgress),
-            verify_chunk,
-            interval,
-            verify_all,
         ),
         Ok(Err(err)) => Err(RunError::from(err)),
         Err(cli_err) => return Err(cli_err),
@@ -216,7 +177,6 @@ fn update(
             to_block: report.to_block,
             chunks_committed: report.chunks_committed,
             total_pools_written: report.total_pools_written,
-            total_liquidity_applies: report.total_liquidity_applies,
         }),
         Err(RunError::Cancelled) => Ok(PoolReport::UpdateCancelled { chain_id: chain }),
         Err(err) => {
@@ -288,12 +248,12 @@ fn verify(
     pool_manager: Option<&str>,
 ) -> Result<PoolReport, CliError> {
     let database_path = ctx.database_path()?.value;
-    let (computed, target) = {
+    let request = {
         let (db, _state) = DegenbotDb::open(&database_path)?;
         let conn = db.lock();
         fetch_verify_state(&conn, chain_id, pool, family, pool_manager)?
     };
-    // The arm verifies a row stored for `chain_id` against the node, so the
+    // The arm resolves catalog identity for `chain_id`, so the
     // provider is bound to that chain: an endpoint serving another chain is
     // refused before any on-chain comparison reports phantom divergences.
     let chain = u64::try_from(chain_id).map_err(|_| {
@@ -316,41 +276,20 @@ fn verify(
             degenbot_rpc::provider::AlloyProvider::for_chain(rpc_url, chain, RPC_MAX_RETRIES)
                 .await
                 .map_err(|err| CliError::BlockResolution(err.to_string()))?;
-        match target {
-            VerifyTarget::V3(address) => {
-                verify_v3_liquidity_map_on_chain(&provider, address, &computed, block_number)
-                    .await
-                    .map_err(|err| {
-                        CliError::PoolUpdate(Box::new(PoolUpdateFailure {
-                            error: err,
-                            rpc_url: rpc_url.to_string(),
-                            chain_id,
-                            from_block: block_number,
-                            to_block: Some(block_number),
-                            resume: None,
-                        }))
-                    })
-            }
-            VerifyTarget::V4 { manager, pool_id } => verify_v4_liquidity_map_on_chain(
-                &provider,
-                manager,
-                pool_id,
-                &computed,
-                block_number,
-            )
+        verify_tick_map_snapshot(&provider, request, block_number)
             .await
-            .map_err(|err| {
+            .map_err(|error| {
                 CliError::PoolUpdate(Box::new(PoolUpdateFailure {
-                    error: err,
+                    error,
                     rpc_url: rpc_url.to_string(),
                     chain_id,
                     from_block: block_number,
                     to_block: Some(block_number),
                     resume: None,
                 }))
-            }),
-        }
+            })
     })??;
+
     Ok(PoolReport::Verified {
         pool: pool.to_string(),
         family,
@@ -403,69 +342,43 @@ pub fn reset_verify_provider_build_count() -> u64 {
     VERIFY_PROVIDER_BUILDS.swap(0, Ordering::Relaxed)
 }
 
-/// Fetch the pool's committed liquidity map + resolve the verify target.
+/// Resolve the contract identity and tick spacing from the catalog.
 fn fetch_verify_state(
     conn: &rusqlite::Connection,
     chain_id: i64,
     pool: &str,
     family: PoolFamily,
     pool_manager: Option<&str>,
-) -> Result<(ComputedLiquidityUpdate, VerifyTarget), CliError> {
-    match family {
-        PoolFamily::V3 => {
-            let address: Address = pool
-                .parse()
-                .map_err(|_| CliError::InvalidAddress(pool.to_string()))?;
-            let key = address.to_checksum(None);
-            let state = DegenbotDb::fetch_v3_pool_update_state_on_conn(conn, chain_id, &key)?
-                .ok_or_else(|| {
-                    CliError::InvalidArgument(format!(
-                        "v3 pool {key} not found on chain {chain_id}"
-                    ))
-                })?;
-            let (tick_bitmap, tick_data) =
-                DegenbotDb::fetch_v3_liquidity_map_on_conn(conn, state.pool_id)?;
-            Ok((
-                ComputedLiquidityUpdate {
-                    pool_id: state.pool_id,
-                    tick_spacing: state.tick_spacing,
-                    tick_data,
-                    tick_bitmap,
-                    last_event: None,
-                },
-                VerifyTarget::V3(address),
-            ))
-        }
+) -> Result<TickMapRequest, CliError> {
+    let target = match family {
+        PoolFamily::V3 => LiquidityMapTarget::V3(
+            pool.parse()
+                .map_err(|_| CliError::InvalidAddress(pool.to_string()))?,
+        ),
         PoolFamily::V4 => {
             let manager = pool_manager.ok_or_else(|| {
                 CliError::InvalidArgument(
                     "--pool-manager is required for --family v4 (the PoolManager singleton)."
-                        .to_string(),
+                        .into(),
                 )
             })?;
-            let manager: Address = manager
-                .parse()
-                .map_err(|_| CliError::InvalidAddress(manager.to_string()))?;
-            let pool_id = B256::from_str(pool.strip_prefix("0x").unwrap_or(pool))
-                .map_err(|_| CliError::InvalidAddress(pool.to_string()))?;
-            let state = DegenbotDb::fetch_v4_pool_update_state_on_conn(conn, pool, chain_id)?
-                .ok_or_else(|| {
-                    CliError::InvalidArgument(format!(
-                        "v4 pool {pool} not found on chain {chain_id}"
-                    ))
-                })?;
-            let (tick_bitmap, tick_data) =
-                DegenbotDb::fetch_v4_liquidity_map_on_conn(conn, state.pool_id)?;
-            Ok((
-                ComputedLiquidityUpdate {
-                    pool_id: state.pool_id,
-                    tick_spacing: state.tick_spacing,
-                    tick_data,
-                    tick_bitmap,
-                    last_event: None,
-                },
-                VerifyTarget::V4 { manager, pool_id },
+            LiquidityMapTarget::V4 {
+                pool_manager: manager
+                    .parse()
+                    .map_err(|_| CliError::InvalidAddress(manager.to_string()))?,
+                pool_id: B256::from_str(pool.strip_prefix("0x").unwrap_or(pool))
+                    .map_err(|_| CliError::InvalidAddress(pool.to_string()))?,
+            }
+        }
+    };
+    catalog_tick_map_request(conn, chain_id, target).map_err(|error| match error {
+        RunError::Db(degenbot_db::DbError::Sqlite(rusqlite::Error::QueryReturnedNoRows)) => {
+            CliError::InvalidArgument(format!(
+                "{} pool {pool} not found on chain {chain_id}",
+                family.as_str()
             ))
         }
-    }
+        RunError::Db(error) => CliError::Database(error),
+        other => CliError::InvalidArgument(other.to_string()),
+    })
 }

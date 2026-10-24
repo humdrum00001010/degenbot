@@ -37,7 +37,6 @@ pub mod stance;
 pub mod state_lock;
 pub mod swap_simulation;
 pub mod telemetry_port;
-pub mod tick_assembly;
 
 // Re-export the pool-registry + family-state types the substrate modules
 // share (the same set `degenbot-bot::bot_core` re-exports at its historical
@@ -840,8 +839,9 @@ impl BotState {
     ///   values of the first forward event ARE the registration state, so
     ///   `restore_before_block(B)` handles a single delta at `B` (and any
     ///   target below the earliest delta) by popping down to registration
-    ///   state. The ONLY unrecoverable case is an empty journal
-    ///   (`restore_before_block` panics on empty) → `!is_empty()`.
+    ///   state. An empty journal cannot restore, and neither can a target at
+    ///   or before either snapshot horizon: the imported state already
+    ///   includes that block and its prior state was never journaled.
     ///
     /// A pool whose newest delta is below `block` (idempotent no-op restore)
     /// returns `true` under both predicates.
@@ -873,9 +873,16 @@ impl BotState {
                     .earliest_block()
                     .is_some_and(|earliest| earliest < block)
             }
-            // No genesis anchor — empty journal is the only too-deep case.
-            PoolEntry::V3(p) => !p.1.journal.is_empty(),
-            PoolEntry::V4(p) => !p.1.journal.is_empty(),
+            PoolEntry::V3(p) => {
+                !p.1.journal.is_empty()
+                    && block > p.1.initial_state_block
+                    && p.1.initial_tick_data_block.is_none_or(|seed| block > seed)
+            }
+            PoolEntry::V4(p) => {
+                !p.1.journal.is_empty()
+                    && block > p.1.initial_state_block
+                    && p.1.initial_tick_data_block.is_none_or(|seed| block > seed)
+            }
             // Curve carries a genesis delta (mirror of V2) — a target at/before
             // the genesis block is too-deep: `earliest < block`.
             PoolEntry::Curve(p) => {

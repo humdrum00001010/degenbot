@@ -18,10 +18,9 @@ use crate::strategy_kit::StrategyKit;
 use degenbot_db::connection::DegenbotDb;
 use degenbot_eventhub::Hub;
 use degenbot_rpc::provider::AlloyProvider;
-use degenbot_rpc::AlloyTickBootstrapRpc;
 use degenbot_substrate::connector_index::{OnChainLiquidityRanker, V2ConnectorIndex};
 use degenbot_substrate::driver_spawn::{DriverExit, DriverFuture, DriverSpawnFactory};
-use degenbot_substrate::pool_ingress::{AlloyLiquidityLogSource, AlloySampleVerifier, DbArm};
+use degenbot_substrate::pool_ingress::AlloySampleVerifier;
 use degenbot_substrate::RouteRegistry;
 
 use degenbot_rpc::pending_tx_stream::PendingTxStream;
@@ -29,10 +28,6 @@ use degenbot_submission::submission_ledger::NonceLane;
 
 use super::driver_loop::BackrunDriver;
 use super::node_capability::NodeCapability;
-
-/// The `eth_getLogs` chunk size for the ingress's per-pool backfill fetch:
-/// a long Db-to-head lag is closed in ~1000-block requests.
-const BACKFILL_LOG_CHUNK_BLOCKS: u64 = 1_000;
 
 /// The strategy-owned boot product consumed by both runtime shapes.
 ///
@@ -47,8 +42,7 @@ pub struct BackrunStrategyBoot {
     pub(crate) registry: Arc<RouteRegistry>,
     pub(crate) execution: ExecutionContext,
     /// The boot DB handle behind the registry's token joins; `None` leaves
-    /// the discovery lane shut. The same held connection the kit's ingress
-    /// was built over.
+    /// the discovery lane shut.
     pub(crate) connector_db: Option<Arc<DegenbotDb>>,
     /// The boot-resolved strategy kit: the provisioning ingress with its
     /// chain arm + chain-sample policy attached, and the discovery handles.
@@ -264,25 +258,9 @@ impl BackrunBootResources {
             .map_or_else(String::new, |join| join.rpc_url.clone());
         let cfg = ecosystem.config(&self.config, rpc_url);
         let provider = self.join.as_ref().map(|join| Arc::clone(&join.provider));
-        let db_arm = self
-            .connector_db
-            .clone()
-            .zip(provider.as_ref())
-            .map(|(db, provider)| {
-                DbArm::new(
-                    db,
-                    Arc::new(AlloyLiquidityLogSource::new(
-                        Arc::clone(provider),
-                        BACKFILL_LOG_CHUNK_BLOCKS,
-                    )),
-                )
-            });
         let kit = StrategyKit::resolve(
             Some(Arc::clone(&self.registry)),
-            db_arm,
-            provider
-                .as_ref()
-                .map(|provider| Arc::new(AlloyTickBootstrapRpc::new(Arc::clone(provider))) as _),
+            provider.as_ref().map(|provider| Arc::clone(provider) as _),
             cfg.verify_ticks,
             provider
                 .as_ref()

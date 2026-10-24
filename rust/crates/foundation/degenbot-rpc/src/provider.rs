@@ -487,6 +487,7 @@ fn is_idempotent_rpc_method(method: &str) -> bool {
             | "eth_gasPrice"
             | "eth_maxPriorityFeePerGas"
             | "eth_getProof"
+            | "erigon_getTickMaps"
     )
 }
 

@@ -11,8 +11,7 @@ DEGENBOT_DUAL_DRIVER_GATE=1).
 The Python consumer path reaches the fixture boot through the PyO3
 seams the Python driver uses:
 
-* S (ledger row 5) via degenbot._ffi.Bot.load_snapshot_from_db —
-  the Rust-owned snapshot load, read back through the shared state.
+* The snapshot seed stays absent until an Erigon pool snapshot is accepted.
 * the candidate-pool graph via degenbot._ffi.build_path_graph — the
   Rust-owned build_path_graph seam the Python pathfinding wrapper
   calls (src/degenbot/pathfinding/_pathfinding.py).
@@ -32,7 +31,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from degenbot._ffi import Bot, PathGraph, PoolKind, build_path_graph
+from degenbot._ffi import PathGraph, PoolKind, build_path_graph
 
 _FIXTURE_DIR = Path(__file__).parent / "fixtures"
 _ORACLE_PATH = _FIXTURE_DIR / "settlement_bot_boot.json"
@@ -44,19 +43,13 @@ _ALLOWED_STATUSES = {
     "DRIVER-POLICY",
     "PARTIAL",
     "BLOCKED",
+    "RETIRED",
 }
 
 
 def _load_oracle() -> dict:
     with _ORACLE_PATH.open() as handle:
         return json.load(handle)
-
-
-def _python_seed_block() -> int | None:
-    """The Python driver's snapshot seed block against the fixture DB."""
-    bot = Bot(1)
-    bot.load_snapshot_from_db(str(_DB_PATH), 1)
-    return bot.snapshot_seed_block
 
 
 def _python_graph() -> PathGraph:
@@ -74,9 +67,6 @@ def test_python_consumer_boot_decisions_match_shared_oracle() -> None:
     oracle = _load_oracle()
     expected = oracle["expected"]
     python_reachable = oracle["python_reachable"]
-
-    assert _python_seed_block() == expected["snapshot_seed_block"]
-    assert _python_seed_block() == python_reachable["snapshot_seed_block"]
 
     graph = _python_graph()
     # The Python discovery enumeration count and the Rust discovery count
@@ -102,12 +92,6 @@ def test_seeded_divergence_in_oracle_fails_the_python_comparator() -> None:
     checked-in oracle is never written; the mutation lives only in memory.
     """
     oracle = _load_oracle()
-    mutated = json.loads(json.dumps(oracle))
-    mutated["expected"]["snapshot_seed_block"] = 12_340_000
-    assert _python_seed_block() != mutated["expected"]["snapshot_seed_block"], (
-        "a mutated expected S must fail the Python comparator"
-    )
-
     graph = _python_graph()
     mutated_nodes = oracle["python_reachable"]["graph_nodes"] + 1
     assert len(graph.pool_id_to_kind) != mutated_nodes, (

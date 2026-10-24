@@ -9,7 +9,7 @@ the token/pool builders, and the one-block ``OfflineProvider`` casettes used by
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from degenbot._ffi import Bot as _Engine
 from degenbot.abi import encode as abi_encode
@@ -106,6 +106,32 @@ def v2_offline_provider(
     )
 
 
+def _complete_tick_block(block: int, calls: dict[str, Any], pool: dict[str, Any]) -> dict[str, Any]:
+    block_hash = "0x" + "11" * 32
+    spacing, tick, liquidity = pool["tickSpacing"], pool["tick"], int(pool["liquidity"], 16)
+    lower = (tick // spacing) * spacing
+    pool["ticks"] = [
+        {"tick": lower, "liquidityGross": hex(liquidity), "liquidityNet": str(liquidity)},
+        {
+            "tick": lower + spacing,
+            "liquidityGross": hex(liquidity),
+            "liquidityNet": str(-liquidity),
+        },
+    ]
+    return {
+        "timestamp": 1_700_000_000,
+        "hash": block_hash,
+        "calls": calls,
+        "code": {},
+        "tick_maps": {
+            "chainId": "0x1",
+            "blockNumber": hex(block),
+            "blockHash": block_hash,
+            "pools": [pool],
+        },
+    }
+
+
 def v3_offline_provider(
     *,
     weth_addr: str,
@@ -119,11 +145,7 @@ def v3_offline_provider(
 ) -> OfflineProvider:
     """A one-block ``OfflineProvider`` serving the V3 build RPC responses.
 
-    The recorded calls key on the alloy transport's exact-calldata format:
-    ``factory()``/``token0()``/``token1()``/``fee()``/``tickSpacing()``/
-    ``slot0()``/``liquidity()`` plus a ``tickBitmap(int16)`` read at the single
-    sparse seed word (empty -> no ``ticks()`` calls). The seed word mirrors the
-    core's ``get_tick_word_and_bit_position`` (tick / spacing, then ``>> 8``).
+    Immutable getter calls accompany the complete block-pinned Erigon response.
     """
     factory_enc = abi_encode(types=["address"], args=[factory_addr]).hex()
     token0_enc = abi_encode(types=["address"], args=[weth_addr]).hex()
@@ -153,7 +175,22 @@ def v3_offline_provider(
     }
     return OfflineProvider(
         chain_id=1,
-        blocks={str(block): {"timestamp": 1_700_000_000, "calls": calls, "code": {}}},
+        blocks={
+            str(block): _complete_tick_block(
+                block,
+                calls,
+                {
+                    "address": pool_addr,
+                    "protocol": "uniswapV3",
+                    "tickSpacing": V3_TICK_SPACING,
+                    "tick": tick,
+                    "sqrtPriceX96": hex(sqrt_price),
+                    "liquidity": hex(liquidity),
+                    "protocolFee": 0,
+                    "lpFee": V3_FEE,
+                },
+            )
+        },
     )
 
 
@@ -171,10 +208,7 @@ def v4_offline_provider(
 ) -> OfflineProvider:
     """A one-block ``OfflineProvider`` serving the V4 managed-pool build responses.
 
-    All calls hit the ``StateView`` contract (``PoolManager`` itself does NOT
-    expose the state getters): ``getSlot0(bytes32)`` + ``getLiquidity(bytes32)``
-    + a ``getTickBitmap(bytes32,int16)`` sparse seed read. The seed word mirrors
-    the core's ``get_tick_word_and_bit_position``.
+    The complete snapshot is recorded alongside StateView getter responses.
     """
     pid = to_bytes(pool_id)
     slot0_calldata = encode_function_calldata("getSlot0(bytes32)", [pid])
@@ -194,5 +228,21 @@ def v4_offline_provider(
     }
     return OfflineProvider(
         chain_id=1,
-        blocks={str(block): {"timestamp": 1_700_000_000, "calls": calls, "code": {}}},
+        blocks={
+            str(block): _complete_tick_block(
+                block,
+                calls,
+                {
+                    "address": pool_manager,
+                    "protocol": "uniswapV4",
+                    "poolId": pool_id,
+                    "tickSpacing": V4_TICK_SPACING,
+                    "tick": tick,
+                    "sqrtPriceX96": hex(sqrt_price),
+                    "liquidity": hex(liquidity),
+                    "protocolFee": protocol_fee,
+                    "lpFee": lp_fee,
+                },
+            )
+        },
     )

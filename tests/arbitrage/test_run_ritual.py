@@ -167,13 +167,11 @@ class _StubHost:
             discovery_batch_size=100,
             permutation_filter=None,
         )
-        self.v3_snapshot = None
-        self.v4_snapshot = None
         self.bot = self.session.bot
         self.engine_registry = self.session.engine_registry
 
-    def trim(self, *, close_read_tx: bool = True) -> None:
-        self.events.append(("trim", close_read_tx))
+    def trim(self) -> None:
+        self.events.append("trim")
 
     def pump_finished_watchdog(self):
         return _noop_coro()
@@ -339,7 +337,7 @@ class TestRegistrationHandoff:
 
         ritual.registration()
 
-        assert ("trim", True) in host.events
+        assert "trim" in host.events
 
     async def test_backrun_only_boot_enables_the_active_hosted_arms(self) -> None:
         host = _StubHost(settlement_active=False)
@@ -351,9 +349,8 @@ class TestRegistrationHandoff:
         await RunRitual(host).run()
         assert host.session.engine_registry.engine.resume_facets == []
 
-    async def test_cancelled_registration_skips_the_read_tx_canary(self) -> None:
-        """The hand-off's CancelledError semantics: skip the read-tx canary,
-        run the rest of the trim."""
+    async def test_cancelled_registration_trims_state_and_propagates_cancellation(self) -> None:
+        """Cancellation releases Python state and reaches the caller."""
         host = _StubHost()
         started = asyncio.Event()
 
@@ -375,8 +372,7 @@ class TestRegistrationHandoff:
 
         with pytest.raises(asyncio.CancelledError):
             await task
-        assert ("trim", False) in host.events
-        assert ("trim", True) not in host.events
+        assert host.events.count("trim") == 1
 
     async def test_registration_failure_surfaces_through_the_watch_verdict(self) -> None:
         """A fatal registration error takes the watch's RegistrationFailed

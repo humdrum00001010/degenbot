@@ -26,42 +26,12 @@ fn v2_fee_pair() -> V2FeePair {
     V2FeePair::from_discovered(Some(3), Some(3), Some(1_000))
 }
 
-/// Test stand-in for the Db→head backfill transport. The fixtures stamp no
-/// `liquidity_update_block`, so no window is ever backfilled; an unexpected
-/// fetch declines loudly rather than staging stale state.
-struct NoBackfill;
-
-impl degenbot_substrate::pool_ingress::LiquidityLogSource for NoBackfill {
-    fn fetch_v3_liquidity_events(
-        &self,
-        _pool: alloy::primitives::Address,
-        _from: u64,
-        _to: u64,
-    ) -> Result<Vec<degenbot_db::LiquidityUpdateEvent>, String> {
-        Err("this fixture wires no backfill transport".into())
-    }
-
-    fn fetch_v4_liquidity_events(
-        &self,
-        _manager: alloy::primitives::Address,
-        _pool_id: alloy::primitives::B256,
-        _from: u64,
-        _to: u64,
-    ) -> Result<Vec<degenbot_db::LiquidityUpdateEvent>, String> {
-        Err("this fixture wires no backfill transport".into())
-    }
-}
-
 fn market_context(
     registry: Option<std::sync::Arc<degenbot_substrate::RouteRegistry>>,
     db: Option<std::sync::Arc<degenbot_db::connection::DegenbotDb>>,
 ) -> MarketContext {
-    let db_arm = db.clone().map(|db| {
-        degenbot_substrate::pool_ingress::DbArm::new(db, std::sync::Arc::new(NoBackfill))
-    });
     let kit = degenbot_strategy::strategy_kit::StrategyKit::resolve(
         registry,
-        db_arm,
         None,
         degenbot_substrate::pool_ingress::VerifyLevel::default(),
         None,

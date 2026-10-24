@@ -37,7 +37,6 @@ use degenbot::bot_core::pool_builder::builder::{
 };
 use degenbot::bot_core::{Bot, RegisterV2PoolError, RegisterV3PoolError, RegisterV4PoolError};
 use degenbot::db::discovery_read::DiscoveryPoolRow;
-use degenbot::db::snapshot::TickMapDb;
 use degenbot::pathfinding::PoolKind;
 use degenbot::solvers::mixed::PoolHop;
 use degenbot::substrate::state_lock::LockSite;
@@ -51,8 +50,6 @@ pub struct LiveContext<'a> {
     pub block: Option<u64>,
     /// The construction I/O (DB + RPC adapters).
     pub io: &'a ConstructionIo,
-    /// The optional DB tick-map handle (Tracked arms).
-    pub db: Option<&'a dyn TickMapDb>,
 }
 
 /// Run the live pipeline over the batched discovery enumeration.
@@ -188,7 +185,7 @@ async fn build_and_register(
     for node_idx in &candidate.pool_indices {
         let node = &built.nodes[*node_idx];
         let row = &rows[node.row_index];
-        if let Err(outcome) = verify_one(driver, pipeline, row, ctx).await {
+        if let Err(outcome) = verify_one(driver, pipeline, row).await {
             return outcome;
         }
     }
@@ -271,9 +268,9 @@ async fn build_one(
             let params = build_v3(
                 ctx.chain_id,
                 r.pool.address,
-                ctx.db,
                 ctx.io,
                 Some(build_block),
+                None,
             )
             .await
             .map_err(|e| BuildFailure::Transient(e.to_string()))?;
@@ -301,7 +298,7 @@ async fn build_one(
                 tick_spacing: i32::try_from(r.tick_spacing).unwrap_or(0),
                 hook_address: r.hooks,
             };
-            let result = build_v4(identity, ctx.db, ctx.io, Some(build_block))
+            let result = build_v4(identity, ctx.io, Some(build_block))
                 .await
                 .map_err(|e| BuildFailure::Transient(e.to_string()))?;
             let registered = bot
@@ -420,7 +417,6 @@ async fn verify_one(
     driver: &EngineDriver,
     pipeline: &mut RegistrationPipeline,
     row: &DiscoveryPoolRow,
-    ctx: &LiveContext<'_>,
 ) -> Result<(), RegistrationUnitOutcome> {
     match row {
         DiscoveryPoolRow::V3(r) => {
@@ -432,14 +428,13 @@ async fn verify_one(
                 return Ok(());
             }
             let address = r.pool.address;
-            let block = ctx.block;
             let policy = pipeline.retry_policy;
             // The at-most-once claim and the retry classification are the
             // DRIVER's (`EngineDriver::run_v3_registration_lifecycle_with_retry`):
             // a transient failure releases the claim and the dance re-enters the
             // lifecycle.
             let result = driver
-                .run_v3_registration_lifecycle_with_retry(address, block, &policy)
+                .run_v3_registration_lifecycle_with_retry(address, &policy)
                 .await;
             match result {
                 Ok(()) => {
@@ -459,12 +454,11 @@ async fn verify_one(
             let manager = r.manager.address;
             let mut pool_id = [0_u8; 32];
             pool_id.copy_from_slice(r.pool_hash.as_slice());
-            let block = ctx.block;
             let policy = pipeline.retry_policy;
             // The V4 twin: the claim and the retry classification are the
             // driver's, keyed by the `(PoolManager, pool_id)` pair.
             let result = driver
-                .run_v4_registration_lifecycle_with_retry(manager, pool_id, block, &policy)
+                .run_v4_registration_lifecycle_with_retry(manager, pool_id, &policy)
                 .await;
             match result {
                 Ok(()) => {

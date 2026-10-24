@@ -7,19 +7,15 @@
     clippy::manual_let_else,
     clippy::no_effect_underscore_binding,
     clippy::print_stderr,
-    clippy::similar_names,
     clippy::too_many_lines,
-    clippy::uninlined_format_args,
-    clippy::unwrap_used
+    clippy::uninlined_format_args
 )]
 
 //! Offline generator for the all-CL capture fixture.
 //!
 //! For a curated set of REAL, liquid UNI V3 pools (heavy tick maps,
-//! `tick_spacing` 1/5/10) at a pinned block, fetches on-chain slot0/liquidity,
-//! backfills the tick map via a giant bidirectional `v3_simulate_swap` (the
-//! production sparse-backfill pattern, pull real tick words from the archive
-//! node), builds each pool's `IntV3TickRangeSequence` via the same
+//! `tick_spacing` 1/5/10) at a pinned block, fetches complete Erigon tick-map
+//! snapshots, builds each pool's `IntV3TickRangeSequence` via the same
 //! `build_int_v3_sequence` the bot uses, forms valid 2-hop all-CL paths by
 //! shared token, runs `solve_cl_piecewise` on each, and writes (input sequences
 //! + golden) to a JSONL consumed by `cl_solve_replay`. Deterministic,
@@ -27,7 +23,6 @@
 //!
 //!   `DEGENBOT_CLCAP_RPC=http://host.containers.internal:8545`,
 //!   `DEGENBOT_CLCAP_BLOCK=<pinned block>`,
-//!   `DEGENBOT_CLCAP_MAX_FETCHES=320`,
 //!   `cargo run -p degenbot-solvers --example cl_capture_gen [-- <out.jsonl>`
 //!   `cargo run -p degenbot-solvers --example cl_solve_replay <capture.jsonl>`
 //!
@@ -40,31 +35,16 @@
 //! generator (preferred) or `DR_REPLAY_REGEN=1` on `cl_solve_replay` for
 //! over-shoot-only stale goldens.
 //!
-//! A `.block` sidecar is written next to the output recording the pinned block
-//! + regen command so the offline fixture is reproducible. Raise
-//! `DEGENBOT_CLCAP_MAX_FETCHES` (default 320) to backfill a denser active set.
-
-use hashbrown::HashMap;
 use std::io::Write;
 use std::process::ExitCode;
-use std::sync::Arc;
 
-use alloy::primitives::{Address, B256, I256, U256};
-use degenbot_pools::registry::ConcentratedLiquidityPoolMut;
-use degenbot_pools::tick_fetch::{FetchTickWordError, FetchedTickWord, TickWordFetcher};
-use degenbot_pools::v3_state::{
-    v3_simulate_swap, PoolTickCoverage, RegisterV3PoolParams, SimulateSwapError, V3PoolState,
-};
-use degenbot_pools::TickBootstrapRpc;
-use degenbot_rpc::abi::fetch_v3_slot0_liquidity;
+use alloy::primitives::{Address, B256};
+use degenbot_pools::v3_state::{PoolTickCoverage, RegisterV3PoolParams, V3PoolState};
 use degenbot_rpc::provider::AlloyProvider;
-use degenbot_rpc::AlloyTickBootstrapRpc;
+use degenbot_rpc::{TickMapProtocol, TickMapRequest};
 use degenbot_solvers::cl::IntV3TickRangeSequence;
 use serde_json::{json, Value};
 
-const MAX_FETCHES: usize = 320; // per-pool tick-word fetch cap, overridable
-                                // via DEGENBOT_CLCAP_MAX_FETCHES so a deep backfill can reach dense active
-                                // sets (a liquid pool's busy region can span thousands of tick words).
 const PATH_CAP: usize = 12; // per-block cap, overridable via DEGENBOT_CLCAP_PATH_CAP
 
 // (address, tick_spacing, fee_classic, token0, token1) — liquid UNI V3 pools
@@ -129,37 +109,6 @@ const POOLS: &[Pool] = &[
     ),
 ];
 
-#[derive(Debug)]
-struct BootstrapFetcher {
-    address: Address,
-    rpc: Arc<AlloyTickBootstrapRpc>,
-}
-impl TickWordFetcher for BootstrapFetcher {
-    fn fetch_missing_tick_word(
-        &self,
-        _pool_id: u64,
-        word: i32,
-        block: u64,
-    ) -> Result<FetchedTickWord, FetchTickWordError> {
-        let tick = word
-            .checked_mul(256 * 10)
-            .ok_or(FetchTickWordError::OutOfRange)?;
-        let res = self
-            .rpc
-            .bootstrap_v3_tick_word(&self.address.to_string(), tick, 10, block)
-            .map_err(|_| FetchTickWordError::FetchFailed)?;
-        Ok(match res {
-            None => FetchedTickWord {
-                word,
-                ticks: HashMap::new(),
-            },
-            Some(b) => FetchedTickWord {
-                word: b.word,
-                ticks: b.ticks,
-            },
-        })
-    }
-}
 fn addr(s: &str) -> Address {
     s.parse().expect("address")
 }
@@ -178,10 +127,6 @@ fn hop_ranges(s: &IntV3TickRangeSequence) -> Value {
 }
 
 fn main() -> ExitCode {
-    let max_fetches: usize = std::env::var("DEGENBOT_CLCAP_MAX_FETCHES")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(MAX_FETCHES);
     let path_cap: usize = std::env::var("DEGENBOT_CLCAP_PATH_CAP")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -200,35 +145,28 @@ fn main() -> ExitCode {
         .nth(1)
         .unwrap_or_else(|| "tests/fixtures/cl_capture_offline.jsonl".to_string());
 
-    // 1) Slot0+liquidity per pool on a throwaway runtime, then drop.
-    let setup: Vec<(U256, I256, U256)> =
-        tokio::runtime::Runtime::new().expect("rt").block_on(async {
-            let provider = Arc::new(AlloyProvider::new(&rpc, 10).await.expect("provider"));
-            let mut out = Vec::with_capacity(POOLS.len());
-            for (a, _ts, _f, _t0, _t1) in POOLS {
-                let (sp, tick, liq) = fetch_v3_slot0_liquidity(&provider, &addr(a), Some(block))
-                    .await
-                    .expect("slot0");
-                out.push((sp, tick, liq));
-            }
-            out
-        });
-
-    // 2) Provider kept for the SYNC bootstrap misses (they use get_runtime).
-    let provider = tokio::runtime::Runtime::new()
-        .expect("rt")
-        .block_on(async { Arc::new(AlloyProvider::new(&rpc, 10).await.expect("p")) });
-    let bootstrap = Arc::new(AlloyTickBootstrapRpc::new(Arc::clone(&provider)));
+    let snapshots = tokio::runtime::Runtime::new().expect("rt").block_on(async {
+        let provider = AlloyProvider::new(&rpc, 10).await.expect("provider");
+        let requests = POOLS
+            .iter()
+            .map(|(a, spacing, _, _, _)| TickMapRequest {
+                address: addr(a),
+                protocol: TickMapProtocol::UniswapV3,
+                tick_spacing: *spacing,
+                pool_id: None,
+            })
+            .collect::<Vec<_>>();
+        provider
+            .get_tick_maps(&requests, block.into())
+            .await
+            .expect("complete tick maps")
+    });
 
     let mut seqs: Vec<(usize, IntV3TickRangeSequence)> = Vec::new();
     for (i, pool) in POOLS.iter().enumerate() {
         let (a, ts, fee, t0s, t1s) = pool;
-        let (sqrt, tick_i256, liq_u256) = &setup[i];
+        let snapshot = &snapshots.pools[i];
         let p = addr(a);
-        let fetcher: Arc<dyn TickWordFetcher> = Arc::new(BootstrapFetcher {
-            address: p,
-            rpc: Arc::clone(&bootstrap),
-        });
         let params = RegisterV3PoolParams {
             address: p,
             token0: addr(t0s),
@@ -236,62 +174,31 @@ fn main() -> ExitCode {
             fee: *fee,
             tick_spacing: *ts,
             factory: Address::ZERO,
-            sqrt_price_x96: *sqrt,
-            liquidity: u128::try_from(*liq_u256).unwrap_or(0),
-            tick: i32::try_from(*tick_i256).unwrap_or(0),
-            tick_data: HashMap::new(),
+            sqrt_price_x96: snapshot.sqrt_price_x96,
+            liquidity: snapshot.liquidity,
+            tick: snapshot.tick,
+            tick_data: snapshot.tick_map(block),
             update_block: block,
-            tick_data_block: None,
-            coverage: PoolTickCoverage::Sparse,
-            fetcher: Some(fetcher.clone()),
+            tick_data_block: Some(block),
+            coverage: PoolTickCoverage::Tracked,
+            fetcher: None,
             deployer: Address::ZERO,
             init_hash: B256::ZERO,
             slot_layout: degenbot_pools::v3_state::ClSlotLayout::UniswapV3,
         };
-        let (_identity, mut state) = V3PoolState::from_params(params, 8);
+        let (_identity, state) = V3PoolState::from_params(params, 8);
 
-        // Backfill the tick map: giant bidirectional swap sweeps the price
-        // range, fetching real tick words on each MissingTickWord (bounded).
-        let mut fetches = 0usize;
-        for &zfo in &[false, true] {
-            let amt = I256::try_from(U256::from(u128::MAX)).unwrap();
-            let limit = V3PoolState::default_sqrt_price_limit(zfo);
-            loop {
-                match v3_simulate_swap(&state, *fee, *ts, zfo, amt, limit) {
-                    Ok(_) => break,
-                    Err(SimulateSwapError::MissingTickWord(word)) => {
-                        fetches += 1;
-                        if fetches >= max_fetches {
-                            eprintln!("pool {i} {a}: fetch cap {max_fetches}");
-                            break;
-                        }
-                        match fetcher.fetch_missing_tick_word(0, word, block) {
-                            Ok(w) => {
-                                state.merge_tick_word(&w);
-                            }
-                            Err(_) => break,
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("pool {i} {a} zfo={zfo} backfill: {e:?}");
-                        break;
-                    }
-                }
-            }
-        }
         match state.build_int_v3_sequence(*ts, *fee, false) {
             Some(seq) => {
                 eprintln!(
-                    "pool {i} {a}: {} ranges after {fetches} word-fetches",
+                    "pool {i} {a}: {} ranges from complete snapshot",
                     seq.ranges.len()
                 );
                 seqs.push((i, seq));
             }
-            None => eprintln!("pool {i} {a}: sequence still None after {fetches} fetches"),
+            None => eprintln!("pool {i} {a}: sequence unavailable from complete snapshot"),
         }
     }
-    drop(provider);
-
     if seqs.len() < 2 {
         eprintln!("fewer than 2 sequences ({}); cannot form paths", seqs.len());
         return ExitCode::FAILURE;
@@ -376,13 +283,5 @@ fn main() -> ExitCode {
         }
     }
     eprintln!("---- wrote {n_paths} path(s), {n_profitable} profitable -> {out}");
-    // Record the pinned block + regen command in a sidecar so the offline
-    // fixture is reproducible and any drift is explainable.
-    let _ = std::fs::write(
-        format!("{out}.block"),
-        format!(
-            "block={block}\nregen: DEGENBOT_CLCAP_RPC=<rpc> DEGENBOT_CLCAP_BLOCK={block} DEGENBOT_CLCAP_MAX_FETCHES={max_fetches} cargo run -q -p degenbot-solvers --example cl_capture_gen [-- <out.jsonl>]\n"
-        ),
-    );
     ExitCode::SUCCESS
 }

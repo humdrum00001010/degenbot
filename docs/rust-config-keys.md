@@ -259,7 +259,6 @@ Env names that are not `DEGENBOT_*`: `VERIFICATION_RETRY_MAX_ATTEMPTS`, `VERIFIC
 | --- | --- | --- | --- | --- |
 | `DEGENBOT_CLCAP_RPC` | `offline.clcap_rpc` | `Option<string>` | `(unset; required by the capture examples)` | RPC URL for the offline CL capture/boundary-scan examples (network-gated). |
 | `DEGENBOT_CLCAP_BLOCK` | `offline.clcap_block` | `Option<u64>` | `(unset)` | Pinned block for the CL capture generator. |
-| `DEGENBOT_CLCAP_MAX_FETCHES` | `offline.clcap_max_fetches` | `usize` | `320` | Max active-set fetches backfilled by the CL capture generator. |
 | `DEGENBOT_CLCAP_PATH_CAP` | `offline.clcap_path_cap` | `usize` | `12` | Per-block path cap for the CL capture generator. |
 | `DEGENBOT_SCAN_BLOCK` | `offline.scan_block` | `Option<u64>` | `(unset)` | Block for the CL boundary-scan examples. |
 | `DEGENBOT_FIXTURE_DB` | `offline.fixture_db` | `Option<path>` | `(unset)` | Database path for the standalone-consumer fixture example. |

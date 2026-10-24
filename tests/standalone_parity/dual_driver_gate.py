@@ -42,7 +42,7 @@ import time
 import urllib.request
 from pathlib import Path
 
-from degenbot._ffi import Bot, PoolKind, build_path_graph
+from degenbot._ffi import PoolKind, build_path_graph
 
 _HERE = Path(__file__).resolve().parent
 _FIXTURE_DIR = _HERE / "fixtures"
@@ -106,8 +106,6 @@ def diff_decisions(
 def python_offline_decisions() -> list[dict]:
     """The Python consumer probe's decisions against the parity.db fixture."""
 
-    bot = Bot(1)
-    bot.load_snapshot_from_db(str(_DB_PATH), 1)
     graph = build_path_graph(
         database_path=str(_DB_PATH),
         chain_id=DISCOVERY_CHAIN_ID,
@@ -115,7 +113,6 @@ def python_offline_decisions() -> list[dict]:
         allowed_intermediate_token_ids=None,
     )
     return [
-        {"key": "snapshot_seed_block", "value": bot.snapshot_seed_block},
         {"key": "discovery_count", "value": len(graph.pool_id_to_kind)},
         {"key": "graph.nodes", "value": len(graph.pool_id_to_kind)},
         {"key": "graph.candidate_tokens", "value": sorted(graph.candidate_tokens)},
@@ -131,7 +128,6 @@ def rust_offline_decisions() -> list[dict]:
     """
     expected = load_boot_oracle()["expected"]
     return [
-        {"key": "snapshot_seed_block", "value": expected["snapshot_seed_block"]},
         {"key": "discovery_count", "value": expected["discovery_count"]},
         {"key": "graph.nodes", "value": expected["graph"]["nodes"]},
         {"key": "graph.candidate_tokens", "value": expected["graph"]["candidate_tokens"]},
@@ -142,7 +138,7 @@ def record_offline() -> dict:
     """Rebuild the recorded decision fixture from the offline probes."""
     fixture = {
         "schema": 1,
-        "provenance": load_decisions_fixture()["provenance"],
+        "provenance": "Recorded offline from the parity.db catalogue with build_path_graph (chain 8453) and the native settlement-bot boot oracle. Pool state initializes independently from complete canonical Erigon snapshots. Regenerate with: uv run --no-sync python tests/standalone_parity/dual_driver_gate.py --record",
         "permitted_divergence": load_decisions_fixture()["permitted_divergence"],
         "python": python_offline_decisions(),
         "rust": rust_offline_decisions(),

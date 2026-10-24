@@ -39,9 +39,7 @@ class TestVerificationRetryConfig:
         values = probe.config_values(_POLICY_FIELDS)
 
         assert values["verification_retry_policy.max_attempts"] == defaults.max_attempts
-        assert values["verification_retry_policy.base_delay"] == pytest.approx(
-            defaults.base_delay
-        )
+        assert values["verification_retry_policy.base_delay"] == pytest.approx(defaults.base_delay)
         assert values["verification_retry_policy.max_delay"] == pytest.approx(defaults.max_delay)
         assert values["verification_retry_policy.jitter"] == pytest.approx(defaults.jitter)
 
@@ -108,9 +106,9 @@ def test_the_engine_registry_injects_the_parsed_policy() -> None:
     """The registry forwards every resolved knob to the retry-wrapped lifecycle.
 
     The retry dance lives in the core; the driver shell only injects the
-    policy values, so this pins the adapter's forwarding and the stashed
-    snapshot block.
+    policy values, so this pins the adapter's forwarding.
     """
+
     class _Recorder:
         def __init__(self) -> None:
             self.calls: list[dict[str, object]] = []
@@ -119,21 +117,16 @@ def test_the_engine_registry_injects_the_parsed_policy() -> None:
             self,
             pool_manager: str,
             pool_id_hex: str,
-            snapshot_block: int | None,
             policy: RetryPolicy,
         ) -> None:
-            self.calls.append(
-                {
-                    "pool_manager": pool_manager,
-                    "pool_id_hex": pool_id_hex,
-                    "snapshot_block": snapshot_block,
-                    "policy": policy,
-                }
-            )
+            self.calls.append({
+                "pool_manager": pool_manager,
+                "pool_id_hex": pool_id_hex,
+                "policy": policy,
+            })
 
     engine = _Recorder()
     registry = EngineRegistry(engine=engine)  # type: ignore[arg-type]
-    registry._verify_snapshot_block = 18_000_050
     policy = RetryPolicy(max_attempts=6, base_delay=0.25, max_delay=8.0, jitter=0.3)
 
     registry.run_v4_verify_lifecycle_sync_with_retry(
@@ -144,7 +137,6 @@ def test_the_engine_registry_injects_the_parsed_policy() -> None:
         {
             "pool_manager": UNISWAP_V4_POOL_MANAGER_ADDRESS,
             "pool_id_hex": "0x" + "ab" * 32,
-            "snapshot_block": 18_000_050,
             "policy": policy,
         }
     ]

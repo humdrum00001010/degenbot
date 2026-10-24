@@ -124,15 +124,12 @@ fn exchange_arms_round_trip() {
 }
 
 #[test]
-fn pool_update_defaults_and_gates() {
+fn pool_update_defaults_and_catalog_bounds() {
     assert_eq!(
         resolve(&["degenbot", "pool", "update"]),
         Command::Pool(PoolCommand::Update {
             chunk_size: DEFAULT_CHUNK_SIZE,
             to_block: DEFAULT_TO_BLOCK.to_string(),
-            verify_chunk: true,
-            verify_all: false,
-            verify_all_interval: DEFAULT_VERIFY_ALL_INTERVAL,
         })
     );
     assert_eq!(
@@ -144,17 +141,10 @@ fn pool_update_defaults_and_gates() {
             "5",
             "--to-block",
             "1000",
-            "--no-verify-chunk",
-            "--verify-all",
-            "--verify-all-interval",
-            "7"
         ]),
         Command::Pool(PoolCommand::Update {
             chunk_size: 5,
             to_block: "1000".to_string(),
-            verify_chunk: false,
-            verify_all: true,
-            verify_all_interval: 7,
         })
     );
 }
@@ -599,4 +589,16 @@ fn run_args_tolerates_non_utf8_argv() {
     use std::os::unix::ffi::OsStringExt as _;
     let invalid = std::ffi::OsString::from_vec(vec![0xff, 0xfe]);
     assert_eq!(degenbot_cli::run_args(&[invalid]), 2);
+}
+
+#[test]
+fn pool_update_rejects_retired_liquidity_verification_flags() {
+    for flag in [
+        "--verify-chunk",
+        "--no-verify-chunk",
+        "--verify-all",
+        "--verify-all-interval",
+    ] {
+        assert!(Cli::try_parse_from(["degenbot", "pool", "update", flag]).is_err());
+    }
 }

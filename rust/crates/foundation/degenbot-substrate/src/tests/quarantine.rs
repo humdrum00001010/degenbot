@@ -68,6 +68,15 @@ fn register_v4_on_core_with_pid(
     pool_id_bytes: [u8; 32],
     update_block: u64,
 ) -> u64 {
+    register_v4_on_core_with_blocks(core, pool_id_bytes, update_block, update_block)
+}
+
+fn register_v4_on_core_with_blocks(
+    core: &mut BotState,
+    pool_id_bytes: [u8; 32],
+    update_block: u64,
+    tick_data_block: u64,
+) -> u64 {
     use crate::PoolTickCoverage;
     use crate::{RegisterV4PoolParams, TickInfo, V4PoolKey};
     use alloy::primitives::U128;
@@ -98,7 +107,7 @@ fn register_v4_on_core_with_pid(
         tick: 0,
         tick_data,
         update_block,
-        tick_data_block: None,
+        tick_data_block: Some(tick_data_block),
         coverage: PoolTickCoverage::Tracked,
         fetcher: None,
     })
@@ -623,8 +632,8 @@ fn quarantined_pool_dual_buffer_drain_correctness() {
         I256::try_from(30i128).unwrap(),
         8,
     );
-    // Register the pool (snapshot seed at block 10, tick 60 gross 100).
-    let pool_id = register_v4_on_core(&mut core, 10);
+    // The map predates the replay; the slot0 scalars are already fresh.
+    let pool_id = register_v4_on_core_with_blocks(&mut core, pool_id_bytes, 10, 7);
     core.set_v4_pool_quarantined(pool_manager, pool_id_bytes);
     // The pump has tombstoned block 10 (live events at 10 are complete).
     core.cl_mut().advance_pump_complete_cutoff(10);
@@ -707,7 +716,7 @@ fn quarantined_pool_backfill_always_fully_drained() {
         I256::try_from(40i128).unwrap(),
         9,
     );
-    let pool_id = register_v4_on_core(&mut core, 10);
+    let pool_id = register_v4_on_core_with_blocks(&mut core, pool_id_bytes, 10, 8);
     core.set_v4_pool_quarantined(pool_manager, pool_id_bytes);
     // NO cutoff set (no tombstone yet) — the gated pump drain would yield
     // nothing, but the backfill drain is UNGATED and must still apply.
@@ -717,17 +726,12 @@ fn quarantined_pool_backfill_always_fully_drained() {
     let (tick_data, pinned_block) = core
         .take_v4_post_drain_snapshot(pool_manager, &pool_id_bytes)
         .expect("Tracked pool pins");
-    // The backfill event applied (ungated) → the tick (seed 100 + 40) is
-    // present. `update_block` is MONOTONIC (no rewind): the pool registered
-    // at block 10 and the backfill event is at the older block 9, so the
-    // seed block 10 is retained — applying an older event must not rewind
-    // the metadata to look stale (the backfill drain rewinding a
-    // head-fresh pool's `update_block` to the backfill boundary produced
-    // the solver-state false positives).
+    // Tick-only replay advances the map from 8 to 9 while price stays at 10.
     assert_eq!(
-        pinned_block, 10,
-        "update_block must not rewind to an older backfill block"
+        pinned_block, 9,
+        "verification follows the map clock rather than fresh slot0"
     );
+    assert_eq!(core.pool_update_block(pool_id), 10);
     assert_eq!(
         tick_data.get(&60).unwrap().liquidity_gross,
         U128::from(140),
@@ -886,7 +890,7 @@ fn reorg_during_quarantine_pin_is_independent_of_live_rollback() {
     let pool_manager = Address::from([0x44u8; 20]);
     let pool_id_bytes: [u8; 32] = [0xeeu8; 32];
     let mut core = BotState::new();
-    let pool_id = register_v4_on_core(&mut core, 10);
+    let pool_id = register_v4_on_core(&mut core, 9);
     core.set_v4_pool_quarantined(pool_manager, pool_id_bytes);
     core.cl_mut().advance_pump_complete_cutoff(10);
     // A complete-block Mint at 10 (applied at drain), then pin.
@@ -909,7 +913,10 @@ fn reorg_during_quarantine_pin_is_independent_of_live_rollback() {
     // already-consumed pin (a clone) is UNAFFECTED — verify @ pinned_block
     // 10 would compare this frozen pair against post-reorg on-chain@10
     // (which lacks the Mint) → mismatch → fail-fast (the reorg surfaces).
-    core.restore_pool_before_block(pool_id, 10);
+    assert!(core.has_state_prior_to(pool_id, 10));
+    core.restore_pool_before_block(pool_id, 10)
+        .unwrap()
+        .unwrap();
     let s = core.get_v4_pool(pool_id).unwrap();
     assert_eq!(
         s.tick_data.get(&60).unwrap().liquidity_gross,

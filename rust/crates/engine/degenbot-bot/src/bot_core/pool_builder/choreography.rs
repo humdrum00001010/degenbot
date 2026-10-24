@@ -14,8 +14,8 @@
 //! absorbed as follow-ups as follow-ups; the Curve + Aerodrome
 //! wrappers are the last families still on the temporary `PyBotIo` inline path.
 //!
-//! Every encode/decode comes from [`degenbot_rpc::abi`], shared with
-//! `AlloyTickBootstrapRpc` (the standalone-`cargo add degenbot` consumer), so
+//! Every encode/decode comes from [`degenbot_rpc::abi`], shared by the
+//! standalone Rust and Python driven consumers, so
 //! the choreography stays byte-identical across the ``PyO3`` adapter and the
 //! pure-Rust path. Where no `abi` helper exists (factory/token0/token1/fee/
 //! tickSpacing/erc20 name/symbol/decimals), the 4-byte selector is built from

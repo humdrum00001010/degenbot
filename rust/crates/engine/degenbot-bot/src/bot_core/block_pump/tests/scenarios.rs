@@ -235,6 +235,7 @@ async fn bamkki_routing_fuzz_oracle_holds_across_lifecycle_roles() {
                 tick: 0,
                 tick_data,
                 update_block: block_n - 1,
+                tick_data_block: Some(0),
                 coverage: crate::bot_core::PoolTickCoverage::Tracked,
                 fetcher: None,
                 ..Default::default()
@@ -242,6 +243,8 @@ async fn bamkki_routing_fuzz_oracle_holds_across_lifecycle_roles() {
             .expect("fuzz registration");
             if roles[i] == 2 {
                 core.set_v3_pool_quarantined(*addr);
+            } else {
+                core.set_v3_pool_live(*addr);
             }
         }
 
@@ -357,6 +360,7 @@ async fn bamkki_routing_fuzz_oracle_holds_across_lifecycle_roles() {
                 tick: 0,
                 tick_data,
                 update_block: block_n - 1,
+                tick_data_block: Some(0),
                 coverage: crate::bot_core::PoolTickCoverage::Tracked,
                 fetcher: None,
                 ..Default::default()

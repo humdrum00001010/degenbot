@@ -163,8 +163,7 @@ fn seeded_db(dir: &Path, file_name: &str) -> PathBuf {
     path
 }
 
-/// ONE injected transport covers a genuine 5-chunk run (verify gate ON — the
-/// gate borrows the same injected handle); a run with nothing to advance
+/// One injected transport covers a five-chunk catalog run; a run with nothing to advance
 /// completes a trivial report over the same handle. One test fn: both
 /// scenarios share the one stub + one built provider.
 #[test]
@@ -189,11 +188,6 @@ fn injected_provider_serves_a_multi_chunk_run_and_a_no_work_run() {
         provider.clone(),
         Arc::new(AtomicBool::new(false)),
         Arc::new(NoProgress),
-        // The verification gate is ON — the lifecycle contract covers the
-        // gated path (the gate borrows the run's one injected transport).
-        true,
-        None,
-        false,
     )
     .unwrap();
     assert_eq!(
@@ -213,9 +207,6 @@ fn injected_provider_serves_a_multi_chunk_run_and_a_no_work_run() {
         provider,
         Arc::new(AtomicBool::new(false)),
         Arc::new(NoProgress),
-        true,
-        None,
-        false,
     )
     .unwrap();
     assert_eq!(report.chunks_committed, 0);

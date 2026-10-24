@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "provenance": "Recorded offline from the parity.db fixture boot (RSP-8 / ergo 23DLCY). 'python' is the Python consumer probe (degenbot._ffi Bot.load_snapshot_from_db + build_path_graph, chain 8453); 'rust' is the settlement-bot example offline boot decisions, which the Rust gate (rust/examples/settlement_bot/tests/boot_gate.rs) asserts byte-for-byte against fixtures/settlement_bot_boot.json. Regenerate with: uv run python tests/standalone_parity/dual_driver_gate.py --record",
+  "provenance": "Recorded offline from the parity.db catalogue with build_path_graph (chain 8453) and the native settlement-bot boot oracle. Pool state initializes independently from complete canonical Erigon snapshots. Regenerate with: uv run --no-sync python tests/standalone_parity/dual_driver_gate.py --record",
   "permitted_divergence": [
     {
       "key": "graph.candidate_tokens",
@@ -8,10 +8,6 @@
     }
   ],
   "python": [
-    {
-      "key": "snapshot_seed_block",
-      "value": null
-    },
     {
       "key": "discovery_count",
       "value": 2
@@ -28,10 +24,6 @@
     }
   ],
   "rust": [
-    {
-      "key": "snapshot_seed_block",
-      "value": null
-    },
     {
       "key": "discovery_count",
       "value": 2

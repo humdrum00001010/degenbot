@@ -28,6 +28,7 @@ use degenbot_db::rows::{
     V4PoolRow,
 };
 use degenbot_rpc::provider::{AlloyProvider, EthBlock};
+use degenbot_rpc::tick_snapshot::{TickMapRequest, TickMapSnapshot};
 
 use super::{DbConstruction, RpcConstruction};
 
@@ -272,6 +273,14 @@ impl AlloyRpcConstruction {
 
 #[async_trait]
 impl RpcConstruction for AlloyRpcConstruction {
+    async fn get_tick_maps(
+        &self,
+        requests: &[TickMapRequest],
+        block: alloy::eips::BlockId,
+    ) -> Result<TickMapSnapshot, ProviderError> {
+        self.provider.get_tick_maps(requests, block).await
+    }
+
     async fn get_block_number(&self) -> Result<u64, ProviderError> {
         self.provider.get_block_number().await
     }

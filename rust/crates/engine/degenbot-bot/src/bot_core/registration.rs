@@ -22,10 +22,9 @@ use std::sync::Arc;
 
 use alloy::primitives::aliases::U112;
 use alloy::primitives::{Address, U256};
-use degenbot_pools::tick_fetch::{TickBootstrapRpc, TickWordFetcher};
+use degenbot_pools::tick_fetch::TickWordFetcher;
 use degenbot_substrate::registration_gate::AdmissionVerdict;
 use degenbot_substrate::state_lock::LockSite;
-use degenbot_substrate::tick_assembly::TickMapAssemblyError;
 use degenbot_uniswap::deployments::AddressMismatch;
 use degenbot_uniswap::dex_identity::DexVariant;
 
@@ -137,11 +136,6 @@ impl std::error::Error for ParseAddressError {
     }
 }
 
-/// One normalized tick-map row: `(tick, liquidity_gross: u128,
-/// liquidity_net: i128, block: u64)` — the dict-entry shape the shell's
-/// `build_tick_rows_py` turns into a Python `{tick: (gross, net, block)}`.
-pub type TickRow = (i32, u128, i128, u64);
-
 /// The already-registered V4 fast-path payload: `(pool_id, coverage,
 /// currency0, currency1, pool_manager, fee, tick_spacing, hook_flags,
 /// pool_id_hex, protocol_fee, lp_fee)` — the builder's return surface, read
@@ -214,26 +208,6 @@ pub fn registration_skip_kind(reason: &str) -> &'static str {
         other if other.starts_with("build-v4:") => "pool-build-error",
         _ => "other",
     }
-}
-
-/// Normalize assembled ticks into the dict-row shape the shell marshals into
-/// a Python `{tick: (gross, net, block)}` dict, in the map's own iteration
-/// order (the historical dict ordering — no sort is introduced).
-/// `liquidity_gross` narrows `U128 → u128` (infallible for valid on-chain
-/// values — Uniswap's `type(uint128).max` cap).
-#[must_use]
-pub fn tick_rows(ticks: &hashbrown::HashMap<i32, TickInfo>) -> Vec<TickRow> {
-    ticks
-        .iter()
-        .map(|(&tick, info)| {
-            (
-                tick,
-                info.liquidity_gross.to::<u128>(),
-                info.liquidity_net,
-                info.block,
-            )
-        })
-        .collect()
 }
 
 impl Bot {
@@ -671,64 +645,6 @@ impl Bot {
             ))
             .map_err(ResolveV4IdentityError::Builder)
     }
-
-    /// Assemble a V3 pool's tick map with the `Db → Chain` precedence
-    /// (Decision 6 (B)) and normalize a hit into [`TickRow`] rows — the
-    /// entry point the shell's `assemble_v3_tick_map` method drives with the
-    /// retained `SnapshotDb` borrow (`&dyn TickMapDb`; no `BotState` guard
-    /// is held across the read, and the GIL release stays at the shell).
-    ///
-    /// # Errors
-    /// [`TickMapAssemblyError`] from the Db or Chain arm (Decision 8 (A) —
-    /// loud error over silent degrade).
-    pub fn assemble_v3_tick_map(
-        db: Option<&dyn degenbot_db::snapshot::TickMapDb>,
-        address: Address,
-        tick: i32,
-        tick_spacing: i32,
-        block: u64,
-        chain: Option<&dyn TickBootstrapRpc>,
-    ) -> Result<Option<(Vec<TickRow>, PoolTickCoverage)>, TickMapAssemblyError> {
-        let hit = degenbot_substrate::tick_assembly::assemble_v3_tick_map(
-            db,
-            address,
-            tick,
-            tick_spacing,
-            block,
-            chain,
-        )?;
-        Ok(hit.map(|(ticks, coverage)| (tick_rows(&ticks), coverage)))
-    }
-
-    /// Assemble a V4 pool's tick map — the V4 twin of
-    /// [`Self::assemble_v3_tick_map`] (the Chain arm targets the
-    /// `StateView` contract, NOT the `PoolManager`).
-    ///
-    /// # Errors
-    /// [`TickMapAssemblyError`] as the V3 twin.
-    #[expect(clippy::too_many_arguments)]
-    pub fn assemble_v4_tick_map(
-        db: Option<&dyn degenbot_db::snapshot::TickMapDb>,
-        pool_manager: Address,
-        state_view: Address,
-        pool_id: [u8; 32],
-        tick: i32,
-        tick_spacing: i32,
-        block: u64,
-        chain: Option<&dyn TickBootstrapRpc>,
-    ) -> Result<Option<(Vec<TickRow>, PoolTickCoverage)>, TickMapAssemblyError> {
-        let hit = degenbot_substrate::tick_assembly::assemble_v4_tick_map(
-            db,
-            pool_manager,
-            state_view,
-            pool_id,
-            tick,
-            tick_spacing,
-            block,
-            chain,
-        )?;
-        Ok(hit.map(|(ticks, coverage)| (tick_rows(&ticks), coverage)))
-    }
 }
 
 #[cfg(test)]
@@ -1136,64 +1052,6 @@ mod tests {
             matches!(err, ResolveV4IdentityError::NoConstructionIo),
             "{err:?}"
         );
-    }
-
-    /// The assemble entry points keep the Db→Chain precedence contract: with
-    /// no Db handle and no Chain transport, a miss is `Ok(None)` (the
-    /// cold-start path the shell's `None` return preserves).
-    #[test]
-    fn assemble_tick_maps_miss_without_db_or_chain() {
-        let v3 = Bot::assemble_v3_tick_map(None, Address::from([0x22u8; 20]), 0, 10, 0, None)
-            .expect("a miss is not an error");
-        assert!(v3.is_none(), "cold-start (no Db, no Chain) → miss");
-
-        let v4 = Bot::assemble_v4_tick_map(
-            None,
-            Address::from([0xBBu8; 20]),
-            Address::from([0x7Fu8; 20]),
-            [0xCCu8; 32],
-            0,
-            10,
-            0,
-            None,
-        )
-        .expect("a miss is not an error");
-        assert!(v4.is_none());
-    }
-
-    /// The row-normalization half of the shell's `build_tick_rows_py`:
-    /// `TickInfo` narrows to the `(tick, gross: u128, net: i128, block: u64)`
-    /// dict rows in the map's own iteration order.
-    #[test]
-    fn tick_rows_normalize_tickinfo() {
-        let mut ticks = hashbrown::HashMap::new();
-        ticks.insert(
-            10,
-            TickInfo {
-                liquidity_gross: alloy::primitives::U128::from(5u64),
-                liquidity_net: -3,
-                block: 7,
-            },
-        );
-        ticks.insert(
-            -20,
-            TickInfo {
-                liquidity_gross: alloy::primitives::U128::MAX,
-                liquidity_net: 0,
-                block: 0,
-            },
-        );
-        let rows = super::tick_rows(&ticks);
-        assert_eq!(rows.len(), 2);
-        for (tick, gross, net, block) in rows {
-            if tick == 10 {
-                assert_eq!((gross, net, block), (5u128, -3i128, 7u64));
-            } else {
-                assert_eq!(tick, -20, "unexpected tick {tick}");
-                assert_eq!(gross, alloy::primitives::U128::MAX.to::<u128>());
-                assert_eq!((net, block), (0i128, 0u64));
-            }
-        }
     }
 
     /// The skip-label collapse onto the closed cardinality set (the Python

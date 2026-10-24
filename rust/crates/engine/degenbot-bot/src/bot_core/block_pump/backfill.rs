@@ -226,7 +226,7 @@ impl BlockPump {
 
     /// Backfill the snapshot→WS gap `S+1..W` (inclusive) using the NO-SOLVE path
     /// path. Reads `S` from `BotState::snapshot_seed_block`
-    /// (set by `Bot::load_snapshot_from_db`) and `W` from the `ws_block` param
+    /// (derived from registered complete pool snapshots) and `W` from the `ws_block` param
     /// (the block the WS subscription landed on — `SubscribeState::first_block`,
     /// passed by the pyo3 caller or the engine's auto-backfill before `resume`).
     /// Fetches logs via the pump's own `AlloyProvider` (no `rpc_url` from
@@ -250,25 +250,24 @@ impl BlockPump {
         chunk_size: u64,
     ) -> Result<u64, String> {
         let w = ws_block;
-        let s = {
+        let (s, has_cl_pools) = {
             let arc = self.bot.state_arc();
             let state = arc.read_at(degenbot_substrate::state_lock::LockSite::Pump);
-            state.snapshot_seed_block()
+            (
+                state.snapshot_seed_block(),
+                state.v3_pool_count() + state.cl().v4_pool_count() > 0,
+            )
         };
         let Some(s) = s else {
+            if has_cl_pools {
+                return Err("registered CL pools have no snapshot replay boundary".into());
+            }
             op_info!(
                 domain = pump,
                 "BlockPump::backfill_from_snapshot: no snapshot loaded, cold-start path"
             );
             return Ok(0);
         };
-        if s == 0 {
-            op_warn!(
-                domain = pump,
-                "BlockPump::backfill_from_snapshot: snapshot block S=0, skipping"
-            );
-            return Ok(0);
-        }
         if s >= w {
             op_info!(
                 domain = pump,

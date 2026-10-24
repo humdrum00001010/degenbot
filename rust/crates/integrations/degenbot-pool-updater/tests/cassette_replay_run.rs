@@ -30,9 +30,7 @@ use degenbot_rpc::cassette::Cassette;
 use degenbot_rpc::cassette_replay::CassetteReplayTransport;
 use tempfile::TempDir;
 
-/// The committed golden capture: the Uniswap V3 factory's `PoolCreated` logs
-/// plus the whole-chain V3 Mint/Burn scan over blocks 26102622..=26102626,
-/// recorded against the live node by `record_updater_cassette`.
+/// The capture supplies the factory's pool-creation events for this block span.
 const CASSETTE_PATH: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../../../tests/fixtures/cassettes/pool_update_chunk_26102622-26102626.json"
@@ -42,20 +40,15 @@ const CASSETTE_PATH: &str = concat!(
 /// example's documented `--factory` for this corpus file).
 const V3_FACTORY: &str = "0x1F98431c8aD98523631AE4a59f267346ea31F984";
 
-/// Independent literal: the exact number of ledger entries the replayed
-/// chunk serves from the cassette per run - the RPC round-trip count of the
-/// chunk's fetch surface (one `eth_getLogs` for the factory's `PoolCreated`
-/// pass + one whole-chain `eth_getLogs` for the V3 `Mint`/`Burn` scan; the
-/// run resolves its tip from the pin, so no `eth_blockNumber`). The RPC
-/// counter drift gate: an added or removed fetch pass (batching, a new
-/// scan, a re-fetch) changes this and fails the plain `cargo test` run.
-const EXPECTED_RPC_ROUND_TRIPS: u64 = 2;
+/// Discovery issues one factory-filtered `eth_getLogs` request. The explicit
+/// target block avoids an additional head lookup.
+const EXPECTED_RPC_ROUND_TRIPS: u64 = 1;
 
 /// Independent literal: the serialized payload bytes those served answers
-/// carried (the recorded `result` members in wire form). Ties the suite's
+/// carried after replay restores hexadecimal RPC quantities. Ties the suite's
 /// expectation to this corpus file: a re-recorded cassette whose answers
 /// carry different traffic fails here too.
-const EXPECTED_RPC_RESPONSE_BYTES: u64 = 4289;
+const EXPECTED_RPC_RESPONSE_BYTES: u64 = 767;
 
 /// A temp DB with one ACTIVE `uniswap_v3` exchange stamped at `from - 1`, so
 /// the run's fetch window is exactly the cassette's recorded span.
@@ -127,11 +120,6 @@ fn run_pool_update_commits_the_recorded_span_offline_and_restarts_clean() {
         provider.clone(),
         Arc::new(AtomicBool::new(false)),
         Arc::new(NoProgress),
-        // The verification gate stays OFF: the corpus records the fetch
-        // surface (getLogs + block tags), not the gate's per-pool tick reads.
-        false,
-        None,
-        false,
     )
     .expect("the replayed run must commit cleanly");
 
@@ -164,8 +152,8 @@ fn run_pool_update_commits_the_recorded_span_offline_and_restarts_clean() {
     );
 
     // Gate: the RPC round-trip drift tripwire. The chunk's fetch surface
-    // serves EXACTLY the committed corpus's entries — every request the run
-    // issued is a served ledger entry (a fixture gap would be a loud error
+    // serves the catalog requests from the committed corpus — every request
+    // is a served ledger entry (a fixture gap would be a loud error
     // mid-run, so `requests == served` here), and the count/bytes are the
     // independent literals above. A shaping regression (an added pass, a
     // dropped scan, a re-recorded corpus) fails this plain assertion.
@@ -195,9 +183,6 @@ fn run_pool_update_commits_the_recorded_span_offline_and_restarts_clean() {
         provider,
         Arc::new(AtomicBool::new(false)),
         Arc::new(NoProgress),
-        false,
-        None,
-        false,
     )
     .expect("the restarted run must be a clean no-op");
     assert_eq!(restart.chunks_committed, 0, "nothing left to commit");

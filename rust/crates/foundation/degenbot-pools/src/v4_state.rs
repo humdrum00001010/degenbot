@@ -326,6 +326,8 @@ pub struct V4PoolState {
     /// replayed at `block_number <= initial_state_block` must NOT adjust the
     /// active-liquidity scalar (the seed already reflects it). Frozen.
     pub initial_state_block: u64,
+    /// Complete-map replay horizon; see [`V3PoolState::initial_tick_data_block`].
+    pub initial_tick_data_block: Option<u64>,
     /// Per-mutation nonce — see [`V3PoolState::state_nonce`] (V4 twin).
     pub state_nonce: u64,
     /// The per-pool registration lifecycle (V4 twin of
@@ -393,6 +395,7 @@ impl Clone for V4PoolState {
             update_block: self.update_block,
             tick_data_block: self.tick_data_block,
             initial_state_block: self.initial_state_block,
+            initial_tick_data_block: self.initial_tick_data_block,
             state_nonce: self.state_nonce,
             registration_lifecycle: self.registration_lifecycle,
             protocol_fee: self.protocol_fee,
@@ -542,6 +545,8 @@ impl V4PoolState {
             // seed. The replay guard always keys on the PRICE seed block.
             tick_data_block: params.tick_data_block.unwrap_or(params.update_block),
             initial_state_block: params.update_block,
+            initial_tick_data_block: (params.coverage == PoolTickCoverage::Tracked)
+                .then_some(params.tick_data_block.unwrap_or(params.update_block)),
             state_nonce: 0,
             // ADR-close of the rolling-start direct-apply gap (V4 twin
             // of the V3 `from_params` change): `Tracked` pools start
@@ -1116,6 +1121,7 @@ mod apply_inherent_tests {
             update_block: 0,
             tick_data_block: 0,
             initial_state_block: 0,
+            initial_tick_data_block: Some(0),
             state_nonce: 0,
             registration_lifecycle: RegistrationLifecycle::default(),
             protocol_fee: 0,

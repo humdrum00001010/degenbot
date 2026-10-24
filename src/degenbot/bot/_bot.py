@@ -26,11 +26,6 @@ from degenbot.builders.request import (
     BuildRequest,
     ConstructionRoute,
 )
-from degenbot.builders.tick_data_fetcher import (
-    FetchedTickData,
-    TickDataTypes,
-    make_tick_data_fetcher,
-)
 from degenbot.builders.type_resolution import (
     pool_class_for_descriptor,
 )
@@ -50,7 +45,6 @@ from degenbot.provider import (
 )
 from degenbot.provider.factory import get_provider_from_config
 from degenbot.registry import ManagedPoolRegistry, PoolRegistry, TokenRegistry
-from degenbot.uniswap.concentrated.types import BitmapAtWord, LiquidityAtTick
 from degenbot.uniswap.v2_liquidity_pool import UniswapV2Pool
 from degenbot.uniswap.v2_types import UniswapV2PoolExternalUpdate
 from degenbot.uniswap.v3_liquidity_pool import UniswapV3Pool
@@ -215,7 +209,7 @@ class Bot(AccountQueryMixin):
         privates or assigning ``bot._*`` attributes; omitted kwargs keep
         the production bindings. An injected object skips the
         construction-time wiring that belongs to the default instance
-        (engine DB snapshot load + ``ConstructionIo`` attach; ``BotIo``
+        (``ConstructionIo`` attach; ``BotIo``
         ``ConstructionIo`` attach) — the injector owns that wiring.
 
         Args:
@@ -266,31 +260,9 @@ class Bot(AccountQueryMixin):
         if py_bot is None:
             self._py_bot = _Engine(self._chain_id)
 
-            # Eagerly load the V3+V4 DB snapshot into the
-            # core ``BotState`` at construction time (Shape 2). This makes the DB
-            # a construction-time property of the Bot — correct use is structural:
-            # the Bot is born with its snapshot or born cold-start, nothing in
-            # between. The core ``Bot::load_snapshot_from_db`` streams V3+V4 into
-            # the core ``SnapshotStore`` + records ``S = min(newest_update_block)``.
-            # ``None``/cold-start (no pools) is NOT an error. The file/memory
-            # snapshot path stays non-DB-only (loaded at ``engine_registry.start``
-            # via ``load_*_from_py``).
-            # The DB file may not exist yet (the Rust database owner creates it on first
-            # write). A missing file is a cold-start: no snapshot pools to load,
-            # `S = None`. The store stays empty; pool registration falls back to
-            # sparse. The file will be created by the first write, at which point a
-            # `Bot` restart will load it.
-            if Path(self.database_path).exists():
-                self._py_bot.load_snapshot_from_db(str(self.database_path), self._chain_id)
-            else:
-                logger.debug(
-                    "DB file %s does not exist; cold-start (no snapshot loaded).",
-                    self.database_path,
-                )
         else:
             # Injection seam (see __init__ docstring): the injector owns
-            # this engine's construction-time wiring (DB snapshot load +
-            # ``ConstructionIo`` attach), which runs for the default
+            # this engine's construction-time ``ConstructionIo`` wiring, which runs for the default
             # engine only.
             self._py_bot = py_bot
 
@@ -495,16 +467,13 @@ class Bot(AccountQueryMixin):
     def release_python_state(self) -> None:
         """Drop Python-side pool/token/tracker caches once Rust owns canonical state.
 
-        After the Rust engine has taken ownership of all pool state (snapshots
-        streamed, pools registered, backfill complete), the Python-side
-        tracker caches, snapshots, and pool/token registries are redundant —
+        After the Rust engine has taken ownership of all pool state, the Python-side
+        tracker caches and pool/token registries are redundant —
         the hot loop only needs the engine and the async Alloy provider
         handle. This drops them so they stop pinning pool objects in memory.
 
         Idempotent; safe to call once, at the end of the startup handshake
-        (after ``build_paths`` completes). Concrete trackers that carry a
-        snapshot (e.g. ``UniswapV3StateTB``) have ``unload_snapshot()``
-        called to release the snapshot reference.
+        (after ``build_paths`` completes).
         """
         _release_python_state(self)
 
@@ -582,7 +551,7 @@ class Bot(AccountQueryMixin):
         """
         return self.build_erc20token(address)
 
-    # ruff: ignore[too-many-locals, too-many-branches, too-many-statements] - one knob per resolved construction input, mirroring the retired keyword surface
+    # ruff: ignore[too-many-locals, too-many-branches] - one knob per resolved construction input, mirroring the retired keyword surface
     def build_pool(
         self,
         address: str,
@@ -648,7 +617,7 @@ class Bot(AccountQueryMixin):
         # Delegated families (V2-style, V3, Aerodrome V2, both Balancer
         # families) build in the core: the Rust `PoolBuilder` owns ALL the io
         # choreography (immutables, reserves/state, DEX resolve incl. Camelot,
-        # CREATE2 verify, V3 tick-map DB-first), registers into `BotState`, and
+        # CREATE2 verify, V3 complete Erigon tick map), registers into `BotState`, and
         # returns the pool id; this facade then registers the pool's tokens in
         # the same `Bot` (ADR-006) and wraps the structural handle with the
         # companion pool class. Curve and the registry-builder families keep
@@ -667,15 +636,12 @@ class Bot(AccountQueryMixin):
             )
 
             # One branch per delegated family mirrors the core's entry points:
-            # V3 threads the tick-data fetcher and the fork slot layout,
+            # V3 threads the fork slot layout,
             # Balancer stable threads the invariant version, and the V2-style
             # families return the full builder identity for the return-surface
             # parity guard.
             builder_identity: tuple[int, str, str, str, str] | None
             if issubclass(pool_class, UniswapV3Pool):
-                # The web3-sync fetcher lets swaps lazily pull neighbouring
-                # tick words beyond the single word the core bootstraps.
-                fetcher = self._make_v3_tick_data_fetcher(address, chain_id)
                 # CL slot layout: the PancakeSwap V3 fork has a divergent
                 # storage layout — pass the family explicitly so the engine's
                 # slot-index consumers (divergence probe, sim-anchor
@@ -691,8 +657,6 @@ class Bot(AccountQueryMixin):
                 b_res = self._py_bot.build_v3_pool(
                     address,
                     block=block,
-                    db=True,
-                    tick_data_fetcher=fetcher,
                     slot_layout=slot_layout,
                     factories=list(route.factories) or None,
                 )
@@ -796,84 +760,6 @@ class Bot(AccountQueryMixin):
             chain_id=chain_id,
             io=io,
             request=request,
-        )
-
-    def _make_v3_tick_data_fetcher(
-        self,
-        pool_address: str,
-        chain_id: ChainId,
-    ) -> Callable[[int, int], FetchedTickData | None]:
-        """Create the V3 tick-data backfill fetcher for a pool address.
-
-        The legacy web3-sync fetcher factory formerly on the
-        retired `V3PoolBuilder`, relocated into this delegating shell. The
-        returned fetcher lazily pulls neighbouring tick words during swap
-        boundary-crossing (ADR-005 sparse-map parity), attached to the
-        Rust-registered pool as a `PyTickWordFetcher` so a Rust `block_on`
-        helper would not re-enter the shared runtime during swap simulation.
-
-        Returns:
-            A callable pulling ``{tick: (liquidity_gross, liquidity_net,
-            block)}`` for an out-of-range bitmap word, or ``None`` when the
-            pool/bitmap is unavailable.
-
-        """
-        return make_tick_data_fetcher(
-            pool_lookup=lambda _block: cast(
-                "UniswapV3Pool | None",
-                self.pools.get(
-                    chain_id=chain_id,
-                    pool_address=get_checksum_address(pool_address),
-                ),
-            ),
-            io=self._io,
-            types=TickDataTypes(
-                bitmap_at_word=BitmapAtWord,
-                liquidity_at_tick=LiquidityAtTick,
-                tick_struct_types=UniswapV3Pool.TICK_STRUCT_TYPES,
-            ),
-        )
-
-    def _make_v4_tick_data_fetcher(
-        self,
-        pool_id: bytes,
-        pool_manager_address: str,
-        state_view_address: str,
-        chain_id: ChainId,
-    ) -> Callable[[int, int], FetchedTickData | None]:
-        """Create the V4 tick-data backfill fetcher for a managed pool.
-
-        The legacy web3-sync fetcher factory formerly on the
-        retired `V4PoolBuilder`, relocated into this delegating shell. The
-        returned fetcher lazily pulls neighbouring tick words during swap
-        boundary-crossing via the state-view (`getTickBitmap` /
-        `getTickLiquidity`), attached to the Rust-registered pool as a
-        `PyTickWordFetcher` (ADR-005 sparse-map parity).
-
-        Returns:
-            A callable pulling ``{tick: (liquidity_gross, liquidity_net,
-            block)}`` for an out-of-range bitmap word, or ``None`` when the
-            pool/bitmap is unavailable.
-
-        """
-        pool_manager_address_ = get_checksum_address(pool_manager_address)
-        return make_tick_data_fetcher(
-            pool_lookup=lambda _: cast(
-                "UniswapV4Pool | None",
-                self.managed_pools.get(
-                    chain_id=chain_id,
-                    pool_manager_address=pool_manager_address_,
-                    pool_id=pool_id,
-                ),
-            ),
-            io=self._io,
-            types=TickDataTypes(
-                bitmap_at_word=BitmapAtWord,
-                liquidity_at_tick=LiquidityAtTick,
-                tick_struct_types=("uint128", "int128"),
-            ),
-            state_view_address=state_view_address,
-            pool_id=bytes(pool_id),
         )
 
     @staticmethod
@@ -1072,13 +958,6 @@ class Bot(AccountQueryMixin):
             hook_address=hook_address,
             state_view_address=state_view_address,
             block=int(state_block) if state_block is not None else None,
-            db=True,
-            tick_data_fetcher=self._make_v4_tick_data_fetcher(
-                pool_id_bytes,
-                pool_manager_address,
-                state_view_address,
-                chain_id,
-            ),
         )
         # Return-surface parity: the identity the builder echoes
         # back must match what the core resolver produced (a divergence is a

@@ -65,7 +65,6 @@ fn load_oracle() -> Value {
 /// The parsed machine-checkable boot report.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct BootReport {
-    snapshot_seed_block: Option<u64>,
     discovery_count: u64,
     graph_nodes: u64,
     graph_candidate_tokens: u64,
@@ -77,12 +76,7 @@ struct BootReport {
 fn parse_boot_report(stdout: &str) -> BootReport {
     let mut report = BootReport::default();
     for line in stdout.lines() {
-        if let Some(body) = line.strip_prefix("parity-ledger snapshot-seed-block S=") {
-            report.snapshot_seed_block = match body.trim() {
-                "None" => None,
-                other => Some(other.parse::<u64>().expect("seed block is None or u64")),
-            };
-        } else if let Some(body) = line.strip_prefix("parity-ledger row=") {
+        if let Some(body) = line.strip_prefix("parity-ledger row=") {
             let mut parts = body.split_whitespace();
             let row = parts.next().expect("row id present").to_string();
             let status = parts
@@ -152,18 +146,6 @@ fn value_to_string(value: &Value) -> Option<String> {
 fn compare(expected: &Value, actual: &BootReport) -> Vec<String> {
     let mut diffs = Vec::new();
     let exp = &expected["expected"];
-
-    let exp_seed = match &exp["snapshot_seed_block"] {
-        Value::Null => None,
-        Value::Number(n) => n.as_u64(),
-        other => panic!("oracle snapshot_seed_block must be null or a number, got {other}"),
-    };
-    if exp_seed != actual.snapshot_seed_block {
-        diffs.push(format!(
-            "snapshot_seed_block: expected {exp_seed:?} actual {:?}",
-            actual.snapshot_seed_block
-        ));
-    }
 
     let exp_discovery = exp["discovery_count"].as_u64().expect("discovery_count");
     if exp_discovery != actual.discovery_count {

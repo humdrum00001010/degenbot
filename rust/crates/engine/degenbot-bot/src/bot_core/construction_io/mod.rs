@@ -6,24 +6,12 @@
 //! through these traits — no `pyo3` here (the no-pyo3-in-cores invariant,
 //! enforced by `just check-no-pyo3-in-cores`).
 //!
-//! # Shape — mirrors the `TickMapDb` / `TickBootstrapRpc` precedent
-//!
-//! `tick_assembly` already composes two core traits: [`TickMapDb`] (the
-//! DB-read seam, `degenbot_db::snapshot::TickMapDb`) and
-//! [`TickBootstrapRpc`] (the RPC-read seam,
-//! `degenbot_pools::tick_fetch::TickBootstrapRpc`). Each is one trait per
-//! concern, with real adapters. This module follows the same shape: one
-//! trait per concern (`DbConstruction` for DB, `RpcConstruction` for RPC),
-//! composed into one handle.
-//!
-//! [`TickMapDb`]: degenbot_db::snapshot::TickMapDb
-//! [`TickBootstrapRpc`]: degenbot_pools::tick_fetch::TickBootstrapRpc
+//! The DB and RPC interfaces remain separate traits, composed into one handle.
 //!
 //! # Posture — Decision 8 (A), loud errors
 //!
-//! `tick_assembly` set the canonical posture: DB errors **propagate** as
-//! `DbError` (never swallowed at the seam); the choreography decides whether
-//! to degrade. This trait inherits that posture unchanged — every method
+//! Errors **propagate** at the seam; the choreography decides whether
+//! to degrade. Every method
 //! returns `Result<_, DbError>` / `Result<_, ProviderError>`, never an
 //! infallible `Option`. The 12x `DegenbotDb::open` boilerplate that lived on
 //! `PyBotIo` (per-call open) is replaced by a held `DegenbotDb` in the native
@@ -57,6 +45,7 @@ use degenbot_db::rows::{
     V4PoolRow,
 };
 use degenbot_rpc::provider::EthBlock;
+use degenbot_rpc::tick_snapshot::{TickMapRequest, TickMapSnapshot};
 
 // Re-export the traits + handle at the `bot_core` root for consumers. The
 // adapters (`NoDb`, `DegenbotDbConstruction`, the RPC native adapter) live in
@@ -158,6 +147,17 @@ pub trait DbConstruction: Send + Sync {
 /// builder-choreography port).
 #[async_trait]
 pub trait RpcConstruction: Send + Sync {
+    async fn get_tick_maps(
+        &self,
+        _requests: &[TickMapRequest],
+        _block: alloy::eips::BlockId,
+    ) -> Result<TickMapSnapshot, ProviderError> {
+        Err(ProviderError::RpcError {
+            code: -32601,
+            message: "erigon_getTickMaps is unsupported by this construction RPC adapter".into(),
+        })
+    }
+
     async fn get_block_number(&self) -> Result<u64, ProviderError>;
 
     async fn get_block(&self, block_number: u64) -> Result<Option<EthBlock>, ProviderError>;

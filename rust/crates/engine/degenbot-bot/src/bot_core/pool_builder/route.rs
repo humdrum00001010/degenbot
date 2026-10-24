@@ -29,11 +29,7 @@
 //! fact riding [`BuildFailure`] so the use site's ledger/metrics fold it
 //! unchanged.
 
-use std::sync::Arc;
-
 use alloy::primitives::Address;
-use degenbot_db::snapshot::TickMapDb;
-use degenbot_pools::tick_fetch::TickWordFetcher;
 use degenbot_pools::v3_state::ClSlotLayout;
 
 use super::builder::{self, PoolBuilderError, V4BuildResult, V4PoolBuildOverrides};
@@ -97,17 +93,9 @@ pub enum RequestedPool {
     },
 }
 
-/// The V3-only construction inputs the other arms ignore (the Python driver
-/// threads a lazy tick-word fetcher and a fork slot-layout hint; the pure
-/// Rust consumer passes `None`).
+/// The V3-only construction inputs the other arms ignore.
 #[derive(Default)]
-pub struct V3RouteInputs<'a> {
-    /// The DB tick-map handle (Tracked arm); `None` seeds Sparse via the
-    /// chain arm.
-    pub db: Option<&'a dyn TickMapDb>,
-    /// The lazy tick-word fetcher stored on the registered V3 pool for
-    /// swap-time boundary detection.
-    pub fetcher: Option<Arc<dyn TickWordFetcher>>,
+pub struct V3RouteInputs {
     /// Explicit CL slot-layout override (a non-JSON fork deployment the
     /// caller resolved from the DB descriptor); `None` = the builder's
     /// deployment-table resolution wins.
@@ -174,7 +162,7 @@ pub async fn construct_pool(
     route: &ConstructionRoute,
     request: &RequestedPool,
     io: &ConstructionIo,
-    v3: V3RouteInputs<'_>,
+    v3: V3RouteInputs,
     block: Option<u64>,
 ) -> Result<ConstructedPool, ConstructionRefusal> {
     match request {
@@ -184,7 +172,7 @@ pub async fn construct_pool(
             pool_manager,
             pool_id,
             overrides,
-        } => construct_v4(bot, *pool_manager, *pool_id, overrides, v3.db, io, block).await,
+        } => construct_v4(bot, *pool_manager, *pool_id, overrides, io, block).await,
     }
 }
 
@@ -318,7 +306,7 @@ async fn construct_v3(
     route: &ConstructionRoute,
     address: Address,
     io: &ConstructionIo,
-    v3: &V3RouteInputs<'_>,
+    v3: &V3RouteInputs,
     block: Option<u64>,
 ) -> Result<ConstructedPool, ConstructionRefusal> {
     if let Some(pool_id) = registered_address_pool(bot, address, RegisteredPoolFamily::V3) {
@@ -346,15 +334,9 @@ async fn construct_v3(
             ),
         });
     }
-    let mut params = builder::build_v3(bot.chain_id(), address, v3.db, io, block)
+    let params = builder::build_v3(bot.chain_id(), address, io, block, v3.slot_layout)
         .await
         .map_err(|err| classify_builder_error(err, address))?;
-    if let Some(fetcher) = &v3.fetcher {
-        params.fetcher = Some(Arc::clone(fetcher));
-    }
-    if let Some(slot_layout) = v3.slot_layout {
-        params.slot_layout = slot_layout;
-    }
     let result = bot
         .state_arc()
         .write_at(LockSite::Core)
@@ -387,7 +369,6 @@ async fn construct_v4(
     pool_manager: Address,
     pool_id: [u8; 32],
     overrides: &V4PoolBuildOverrides,
-    db: Option<&dyn TickMapDb>,
     io: &ConstructionIo,
     block: Option<u64>,
 ) -> Result<ConstructedPool, ConstructionRefusal> {
@@ -409,7 +390,7 @@ async fn construct_v4(
                 }
                 other => classify_builder_error(other, pool_manager),
             })?;
-    let built: V4BuildResult = builder::build_v4(identity, db, io, block)
+    let built: V4BuildResult = builder::build_v4(identity, io, block)
         .await
         .map_err(|err| classify_builder_error(err, pool_manager))?;
     let result = bot

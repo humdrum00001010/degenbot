@@ -116,7 +116,7 @@ fn discovered_non_default_v2_fee_reaches_executor_bytes_with_settlement_parity()
 
     let index = V2ConnectorIndex::load(&db, CHAIN_ID).unwrap();
     let registry = Arc::new(RouteRegistry::new(index));
-    let kit = StrategyKit::resolve(Some(registry), None, None, VerifyLevel::default(), None);
+    let kit = StrategyKit::resolve(Some(registry), None, VerifyLevel::default(), None);
     let runtime = MarketContext::new(CHAIN_ID, Some(Arc::new(db)), kit, 8, 4);
     let mut solver = BackrunSolver::new();
     let affected = admit_extracted(

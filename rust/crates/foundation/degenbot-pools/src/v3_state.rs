@@ -436,6 +436,11 @@ pub struct V3PoolState {
     /// never advanced by `apply_swap`/`apply_liquidity_update`/`update_block`.
     pub initial_state_block: u64,
 
+    /// Complete-map snapshot coverage, unchanged by event application or
+    /// rollback. Sparse maps have no whole-map horizon. Kept separately from
+    /// the scalar seed so older DB maps can replay liquidity up to fresh slot0.
+    pub initial_tick_data_block: Option<u64>,
+
     /// The per-pool registration lifecycle: `Quarantined` during
     /// `register_v3_pool`'s drain+pin+verify (live events deferred to the pump
     /// buffer so the pin's `update_block` cannot outrun `last_complete_block`),
@@ -537,6 +542,7 @@ impl Clone for V3PoolState {
             update_block: self.update_block,
             tick_data_block: self.tick_data_block,
             initial_state_block: self.initial_state_block,
+            initial_tick_data_block: self.initial_tick_data_block,
             state_nonce: self.state_nonce,
             registration_lifecycle: self.registration_lifecycle,
             tick_data: self.tick_data.clone(),
@@ -744,6 +750,8 @@ impl V3PoolState {
             // including active `liquidity`, reflects).
             tick_data_block: params.tick_data_block.unwrap_or(params.update_block),
             initial_state_block: params.update_block,
+            initial_tick_data_block: (params.coverage == PoolTickCoverage::Tracked)
+                .then_some(params.tick_data_block.unwrap_or(params.update_block)),
             state_nonce: 0,
             // ADR-close of the rolling-start direct-apply gap: a
             // freshly-registered `Tracked` pool starts `Quarantined` so NO live
@@ -1565,6 +1573,7 @@ mod apply_inherent_tests {
             update_block: 0,
             tick_data_block: 0,
             initial_state_block: 0,
+            initial_tick_data_block: Some(0),
             state_nonce: 0,
             registration_lifecycle: RegistrationLifecycle::default(),
             tick_data,
@@ -2231,6 +2240,7 @@ mod apply_inherent_tests {
             update_block: 0,
             tick_data_block: 0,
             initial_state_block: 0,
+            initial_tick_data_block: Some(0),
             state_nonce: 0,
             registration_lifecycle: RegistrationLifecycle::default(),
             tick_data,
@@ -2355,6 +2365,7 @@ mod tests {
                 update_block: 0,
                 tick_data_block: 0,
                 initial_state_block: 0,
+                initial_tick_data_block: Some(0),
                 tick_data,
                 coverage: PoolTickCoverage::Tracked,
                 known_bitmap_words: HashSet::new(),

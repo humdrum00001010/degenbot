@@ -29,7 +29,6 @@ if TYPE_CHECKING:
     from degenbot.bot import Bot
     from degenbot.types.aliases import ChainId
     from degenbot.types.chain import ChecksummedAddress
-    from degenbot.uniswap.v3_snapshot import UniswapV3LiquiditySnapshot
 
 
 @dataclasses.dataclass(slots=True, frozen=True)
@@ -197,7 +196,6 @@ class AbstractUniswapV3PoolTracker[Pool: UniswapV3Pool](AbstractPoolTracker[Pool
     _untracked_pools: set[ChecksummedAddress]
     _lock: Lock
     _pool_init_hash: str
-    _snapshot: UniswapV3LiquiditySnapshot | None
 
     def __init__(
         self,
@@ -206,7 +204,6 @@ class AbstractUniswapV3PoolTracker[Pool: UniswapV3Pool](AbstractPoolTracker[Pool
         *,
         chain_id: ChainId | None = None,
         overrides: DeploymentOverrides | None = None,
-        snapshot: UniswapV3LiquiditySnapshot | None = None,
     ) -> None:
         """Initialize the instance."""
         self._bot = bot
@@ -236,15 +233,8 @@ class AbstractUniswapV3PoolTracker[Pool: UniswapV3Pool](AbstractPoolTracker[Pool
         self._factory_address = factory_address
         self._deployer_address = get_checksum_address(deployer_address)
         self._pool_init_hash = pool_init_hash or ""
-        self._snapshot = snapshot
         self._tracked_pools = {}
         self._untracked_pools = set()
-
-    def _apply_pending_liquidity_updates(self, pool: UniswapV3Pool) -> None:
-        """Apply all pending updates from the snapshot."""
-        if self._snapshot is not None:
-            for liquidity_update in self._snapshot.pending_updates(pool.address):
-                pool.update_liquidity_map(liquidity_update)
 
     def get_pool(
         self,
@@ -308,18 +298,8 @@ class AbstractUniswapV3PoolTracker[Pool: UniswapV3Pool](AbstractPoolTracker[Pool
                 raise PoolCreationFailed(
                     message=f"Pool {pool_address} is not a {self.pool_factory.__name__}",
                 )
-            self._apply_pending_liquidity_updates(new_pool)
             self._add_tracked_pool(new_pool)
             return new_pool
-
-    def unload_snapshot(self) -> None:
-        """Drop the snapshot reference so it can be garbage-collected."""
-        self._snapshot = None
-
-    @property
-    def snapshot(self) -> UniswapV3LiquiditySnapshot | None:
-        """The snapshot, if loaded."""
-        return self._snapshot
 
 
 class UniswapV3PoolTracker(AbstractUniswapV3PoolTracker[UniswapV3Pool], pool_factory=UniswapV3Pool):

@@ -1,19 +1,20 @@
 //! Pin for the V3-anchor sparse-tick defect (`unusable_pool_state` on every
 //! declared chain): a target swap that crosses NO initialized tick leaves the
 //! replayed V3 post-state with an empty tick map, and a solver range sequence
-//! cannot be built from it. The fix stages the anchor's tick map through the
-//! pool ingress (`Db → Chain` — the complete per-tick map the pump maintains),
-//! so a healthy wide/range anchor admits and solves while a genuinely
-//! unusable (ticks-less) anchor still rejects.
+//! cannot be built from it. Pool ingress stages the anchor's complete tick map
+//! from the pinned snapshot, so a healthy wide/range anchor admits and solves
+//! while a genuinely unusable (ticks-less) anchor still rejects.
 
 #![expect(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-use alloy::primitives::aliases::U128;
-use alloy::primitives::{address, Address, I256, U256};
+use alloy::primitives::{address, Address, U256};
+use degenbot_core::errors::ProviderResult;
 use degenbot_db::connection::DegenbotDb;
 use degenbot_db::discovery::V3PoolRowInput;
-use degenbot_db::{ApplyBitmapAtWord, ApplyLiquidityAtTick};
 use degenbot_pools::v3_state::ClSlotLayout;
+use degenbot_rpc::tick_snapshot::{
+    PoolTickSnapshot, SnapshotTick, TickMapRequest, TickMapRpc, TickMapSnapshot,
+};
 use degenbot_simulation::sim::evm::journal_pools::{
     PoolFamily, PoolPostKind, PoolPostState, TypedPoolPost,
 };
@@ -23,7 +24,6 @@ use degenbot_strategy::frame_pipeline::MarketContext;
 use degenbot_strategy::ETHEREUM_WETH as WETH;
 use degenbot_substrate::connector_index::{V2ConnectorIndex, V2Edge, V3Edge};
 use degenbot_substrate::executor_hop::{V2FeePair, V2Fees};
-use hashbrown::HashMap as HbMap;
 
 fn v2_fee_pair() -> V2FeePair {
     V2FeePair::from_discovered(Some(3), Some(3), Some(1_000))
@@ -46,10 +46,9 @@ const FACTORY: Address = address!("00000000000000000000000000000000000000ff");
 /// `sqrt(1) * 2^96` — the tick-0 price.
 const SQRT_ONE: u128 = 79_228_162_514_264_337_593_543_950_336;
 
-/// Seed the anchor pool row + its initialized ticks into the in-memory DB, the
-/// complete map the ingestion pump maintains. With no ticks the pool is a
-/// legitimately-empty `Tracked` anchor (the RED case).
-fn seed_anchor(db: &DegenbotDb, ticks: &[i32]) {
+/// Seed the anchor's catalog row. Its complete tick map comes from the fixture
+/// RPC.
+fn seed_anchor(db: &DegenbotDb) {
     db.upsert_exchange(1, "uniswap_v3", FACTORY, None).unwrap();
     db.upsert_v3_pools(
         1,
@@ -65,86 +64,90 @@ fn seed_anchor(db: &DegenbotDb, ticks: &[i32]) {
         }],
     )
     .unwrap();
-    let addr_s = ANCHOR.to_checksum(None);
-    let pool_id: i64 = {
-        let conn = db.lock();
-        conn.query_row(
-            "SELECT id FROM pools WHERE address = ?1 LIMIT 1",
-            [&addr_s],
-            |r| r.get(0),
-        )
-        .unwrap()
-    };
-    let mut tick_bitmap: HbMap<i32, ApplyBitmapAtWord> = HbMap::new();
-    let mut tick_data: HbMap<i32, ApplyLiquidityAtTick> = HbMap::new();
-    for &tick in ticks {
-        tick_data.insert(
-            tick,
-            ApplyLiquidityAtTick {
-                liquidity_gross: U128::from(10_000u64),
-                liquidity_net: I256::try_from(if tick > 0 { 5_000i128 } else { -4_000i128 })
-                    .unwrap(),
-                block: 0,
-            },
-        );
-        let compressed = tick.div_euclid(ANCHOR_SPACING);
-        let word = compressed >> 8;
-        let bit = compressed.rem_euclid(256) as u64;
-        tick_bitmap
-            .entry(word)
-            .or_insert_with(|| ApplyBitmapAtWord {
-                bitmap: U256::ZERO,
-                block: 0,
-            });
-        tick_bitmap.get_mut(&word).unwrap().bitmap |= U256::from(1u64) << bit;
-    }
-    db.upsert_v3_liquidity_positions(pool_id, &tick_data)
-        .unwrap();
-    db.upsert_v3_initialization_maps(pool_id, &tick_bitmap)
-        .unwrap();
 }
 
-/// Test stand-in for the Db→head backfill transport. The fixtures stamp no
-/// `liquidity_update_block`, so no window is ever backfilled; an unexpected
-/// fetch declines loudly rather than staging stale state.
-struct NoBackfill;
+struct SnapshotRpc(Vec<SnapshotTick>);
 
-impl degenbot_substrate::pool_ingress::LiquidityLogSource for NoBackfill {
-    fn fetch_v3_liquidity_events(
-        &self,
-        _pool: alloy::primitives::Address,
-        _from: u64,
-        _to: u64,
-    ) -> Result<Vec<degenbot_db::LiquidityUpdateEvent>, String> {
-        Err("this fixture wires no backfill transport".into())
-    }
-
-    fn fetch_v4_liquidity_events(
-        &self,
-        _manager: alloy::primitives::Address,
-        _pool_id: alloy::primitives::B256,
-        _from: u64,
-        _to: u64,
-    ) -> Result<Vec<degenbot_db::LiquidityUpdateEvent>, String> {
-        Err("this fixture wires no backfill transport".into())
+impl TickMapRpc for SnapshotRpc {
+    fn get_tick_maps<'a>(
+        &'a self,
+        requests: &'a [TickMapRequest],
+        block: alloy::eips::BlockId,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = ProviderResult<TickMapSnapshot>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            Ok(TickMapSnapshot {
+                chain_id: 1,
+                block_number: block.as_u64().unwrap(),
+                block_hash: alloy::primitives::B256::repeat_byte(9),
+                pools: requests
+                    .iter()
+                    .map(|request| PoolTickSnapshot {
+                        address: request.address,
+                        protocol: request.protocol,
+                        pool_id: request.pool_id,
+                        tick_spacing: request.tick_spacing,
+                        tick: 0,
+                        sqrt_price_x96: U256::from(SQRT_ONE),
+                        liquidity: if self.0.is_empty() {
+                            0
+                        } else {
+                            10_000_000_000_000
+                        },
+                        protocol_fee: 0,
+                        lp_fee: ANCHOR_FEE,
+                        ticks: self.0.clone(),
+                    })
+                    .collect(),
+            })
+        })
     }
 }
 
 fn market_context(
     registry: Option<std::sync::Arc<degenbot_substrate::RouteRegistry>>,
     db: Option<std::sync::Arc<degenbot_db::connection::DegenbotDb>>,
+    ticks: &[i32],
 ) -> MarketContext {
-    let db_arm = db.clone().map(|db| {
-        degenbot_substrate::pool_ingress::DbArm::new(db, std::sync::Arc::new(NoBackfill))
-    });
     let kit = degenbot_strategy::strategy_kit::StrategyKit::resolve(
         registry,
-        db_arm,
-        None,
+        Some(std::sync::Arc::new(SnapshotRpc(snapshot_ticks_for_anchor(
+            ticks,
+        )))),
         degenbot_substrate::pool_ingress::VerifyLevel::default(),
         None,
     );
     MarketContext::new(1, db, kit, 8, 4)
+}
+
+fn snapshot_ticks_for_anchor(ticks: &[i32]) -> Vec<SnapshotTick> {
+    if ticks.is_empty() {
+        return Vec::new();
+    }
+    let active = 10_000_000_000_000u128;
+    vec![
+        SnapshotTick {
+            tick: -180,
+            liquidity_gross: active + 4_000,
+            liquidity_net: i128::try_from(active + 4_000).unwrap(),
+        },
+        SnapshotTick {
+            tick: -120,
+            liquidity_gross: 10_000,
+            liquidity_net: -4_000,
+        },
+        SnapshotTick {
+            tick: 120,
+            liquidity_gross: 10_000,
+            liquidity_net: 5_000,
+        },
+        SnapshotTick {
+            tick: 180,
+            liquidity_gross: active + 5_000,
+            liquidity_net: -i128::try_from(active + 5_000).unwrap(),
+        },
+    ]
 }
 
 fn runtime(ticks: &[i32]) -> (MarketContext, u64, u64) {
@@ -159,7 +162,7 @@ fn runtime(ticks: &[i32]) -> (MarketContext, u64, u64) {
         u64::try_from(tok_id).unwrap(),
         u64::try_from(weth_id).unwrap(),
     );
-    seed_anchor(&db, ticks);
+    seed_anchor(&db);
     let mut index = V2ConnectorIndex::default();
     index.push_v3_edge(V3Edge {
         pool_id: 201,
@@ -183,6 +186,7 @@ fn runtime(ticks: &[i32]) -> (MarketContext, u64, u64) {
                 index,
             ))),
             Some(std::sync::Arc::new(db)),
+            ticks,
         ),
         tok_id,
         weth_id,
@@ -191,7 +195,7 @@ fn runtime(ticks: &[i32]) -> (MarketContext, u64, u64) {
 
 /// The frame's replayed V3 post-state: price/liquidity staged, NO touched
 /// ticks (the target swap crossed no initialized tick).
-fn anchor_post_state() -> PoolPostState {
+fn anchor_post_state(liquidity: u128) -> PoolPostState {
     PoolPostState {
         address: ANCHOR,
         family: PoolFamily::V3 {
@@ -202,7 +206,7 @@ fn anchor_post_state() -> PoolPostState {
         kind: PoolPostKind::Typed(TypedPoolPost::V3 {
             sqrt_price_x96: Some(U256::from(SQRT_ONE)),
             tick: Some(0),
-            liquidity: Some(10_000_000_000_000),
+            liquidity: Some(liquidity),
             touched_ticks: Vec::new(),
         }),
     }
@@ -244,19 +248,15 @@ fn admit_mid(solver: &mut BackrunSolver) -> u64 {
         .unwrap()
 }
 
-/// RED half pins the defect (an anchor with no DB ticks cannot project);
-/// GREEN half pins the fix (the Db-staged map makes the anchor modelable).
-/// The gate stays for the genuinely unusable anchor.
 #[test]
-fn v3_anchor_db_tick_map_admits_and_solves() {
-    // RED: the replayed state alone (a Db-registered but tick-less anchor)
-    // cannot project — the whole chain rejects.
+fn v3_anchor_snapshot_tick_map_admits_and_solves() {
+    // A complete but empty map leaves the anchor admitted and unmodelable.
     let (rt, _tok, _weth) = runtime(&[]);
     let mut solver = BackrunSolver::new();
     let affected = admit_extracted(
         &rt,
         &mut solver,
-        &[anchor_post_state()],
+        &[anchor_post_state(0)],
         SEED,
         &mut degenbot_strategy::frame_pipeline::StageTrace::default(),
     );
@@ -281,14 +281,13 @@ fn v3_anchor_db_tick_map_admits_and_solves() {
         other => panic!("expected unusable_pool_state, got {other:?}"),
     }
 
-    // GREEN: the Db-staged tick map fills the replayed map; the same healthy
-    // anchor + healthy V2 hop now solves.
+    // The same frame with initialized boundaries can be modeled and solved.
     let (rt, _tok, _weth) = runtime(&[120, -120]);
     let mut solver = BackrunSolver::new();
     let affected = admit_extracted(
         &rt,
         &mut solver,
-        &[anchor_post_state()],
+        &[anchor_post_state(10_000_000_000_000)],
         SEED,
         &mut degenbot_strategy::frame_pipeline::StageTrace::default(),
     );
@@ -302,7 +301,7 @@ fn v3_anchor_db_tick_map_admits_and_solves() {
     assert_eq!(stats.dfs_declared, 1);
     assert_eq!(
         stats.dfs_evaluated, 1,
-        "the Db-staged map makes the anchor modelable"
+        "the snapshot map makes the anchor modelable"
     );
     assert!(stats.chains[0].reject.is_none());
 }
@@ -314,7 +313,7 @@ fn v3_anchor_db_tick_map_admits_and_solves() {
 #[test]
 fn anchor_admission_survives_u128_liquidity() {
     let (rt, _tok, _weth) = runtime(&[120, -120]);
-    let mut post = anchor_post_state();
+    let mut post = anchor_post_state(10_000_000_000_000);
     if let PoolPostKind::Typed(TypedPoolPost::V3 { liquidity, .. }) = &mut post.kind {
         *liquidity = Some(u128::MAX);
     }
@@ -337,7 +336,7 @@ fn anchor_admission_survives_u128_liquidity() {
 #[test]
 fn replayed_touched_tick_wins_over_ingress_map() {
     let (rt, _tok, _weth) = runtime(&[120, -120]);
-    let mut post = anchor_post_state();
+    let mut post = anchor_post_state(10_000_000_000_000);
     if let PoolPostKind::Typed(TypedPoolPost::V3 { touched_ticks, .. }) = &mut post.kind {
         touched_ticks.push(
             degenbot_simulation::sim::evm::journal_pools::TouchedTickWord {

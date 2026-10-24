@@ -1,8 +1,8 @@
 # degenbot-pool-updater
 
-Pure-Rust pool-updater chunk-loop core: typed RPC event fetching + decode-to-row-input mapping.
+Pure-Rust pool catalog discovery from `PoolCreated` and `Initialize` events.
 
-The pool-updater chunk-loop core: typed RPC event fetching and the decode-to-row-input mapping, the Rust side of the DB-aware pool state update path.
+Each chunk commits pool metadata and exchange discovery checkpoints in one transaction. Complete tick maps come from block-pinned `erigon_getTickMaps` reads during state initialization; the updater does not reconstruct liquidity from historical Mint/Burn events.
 
 ## Usage
 

@@ -43,13 +43,12 @@
 //!    committed work.
 
 #![expect(clippy::unwrap_used)]
-use std::collections::HashMap;
 
 use alloy::primitives::{Address, B256};
 use degenbot_db::{DegenbotDb, V3PoolRowInput};
 use degenbot_pool_updater::{
     apply_chunk_writes_on_conn, ChunkInputs, ChunkWriteReport, ExchangeSpec, PoolCreationToWrite,
-    PoolFamily, PreVerifiedLiquidity,
+    PoolFamily,
 };
 use rusqlite::Connection;
 use tempfile::TempDir;
@@ -110,10 +109,6 @@ fn chunk_inputs_with_v3_pool(exchange_id: i64, addr: Address) -> ChunkInputs {
                 tick_spacing: 10,
             },
         }],
-        v3_liquidity: HashMap::new(),
-        v4_liquidity: HashMap::new(),
-        pool_manager_chain: CHAIN,
-        v4_manager_addresses: HashMap::new(),
     }
 }
 
@@ -140,15 +135,7 @@ fn run_chunk(
 ) -> ChunkWriteReport {
     let mut guard = db.lock();
     let tx = guard.transaction().unwrap();
-    let report = apply_chunk_writes_on_conn(
-        &tx,
-        CHAIN,
-        specs,
-        end,
-        inputs,
-        &PreVerifiedLiquidity::default(),
-    )
-    .unwrap();
+    let report = apply_chunk_writes_on_conn(&tx, CHAIN, specs, end, inputs).unwrap();
     if commit {
         tx.commit().unwrap();
     }

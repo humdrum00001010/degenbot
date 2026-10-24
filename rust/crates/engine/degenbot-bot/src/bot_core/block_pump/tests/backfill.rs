@@ -136,19 +136,49 @@ async fn backfill_from_snapshot_s_ge_w_is_noop() {
     assert_eq!(n, 0, "S >= W → nothing to backfill");
 }
 
-/// `backfill_from_snapshot` no-op when `S = 0` (degenerate
-/// snapshot block — guarded to avoid a `from_block=1` unbounded fetch).
 #[tokio::test]
-async fn backfill_from_snapshot_s_zero_is_noop() {
-    let (pump, _sink) = pump_for_test(None);
+async fn backfill_from_genesis_replays_from_block_one() {
+    let bot = Arc::new(Bot::new(1));
+    let (pump, _sink, _shutdown, asserter) = pump_for_test_with_asserter(bot, None);
     {
         let bot = pump.bot_arc_for_test();
         bot.state_arc()
             .write_at(degenbot_substrate::state_lock::LockSite::Pump)
             .set_snapshot_seed_block(Some(0));
     }
-    let n = pump.backfill_from_snapshot(100, 10).await.unwrap();
-    assert_eq!(n, 0, "S = 0 → skip (degenerate)");
+    asserter.push_success(&Vec::<Log>::new());
+    let n = pump.backfill_from_snapshot(3, 10).await.unwrap();
+    assert_eq!(n, 3);
+}
+
+#[tokio::test]
+async fn registered_pool_snapshot_automatically_closes_startup_gap() {
+    let (bot, _) = bot_with_quarantined_v3_tracked(100, 85);
+    let (pump, _sink, _shutdown, asserter) = pump_for_test_with_asserter(bot, None);
+    asserter.push_success(&Vec::<Log>::new());
+    assert_eq!(pump.backfill_to_ws_block(100).await.unwrap(), 15);
+}
+
+#[tokio::test]
+async fn registered_cl_without_a_snapshot_boundary_refuses_gap_replay() {
+    let bot = Arc::new(Bot::new(1));
+    bot.state_arc()
+        .write_at(degenbot_substrate::state_lock::LockSite::Pump)
+        .register_v3_pool(&degenbot_substrate::RegisterV3PoolParams {
+            address: Address::repeat_byte(0x44),
+            sqrt_price_x96: U256::from(1u128) << 96,
+            fee: 3000,
+            tick_spacing: 60,
+            coverage: degenbot_substrate::PoolTickCoverage::Sparse,
+            ..Default::default()
+        })
+        .unwrap();
+    let (pump, _, _) = pump_for_test_with_bot(bot, None);
+    assert!(pump
+        .backfill_to_ws_block(100)
+        .await
+        .unwrap_err()
+        .contains("snapshot replay boundary"));
 }
 
 /// `resume_from_subscribe` auto-backfills the snapshot→WS gap
@@ -173,7 +203,7 @@ async fn auto_backfill_runs_inside_resume_when_s_lt_w() {
         first_timestamp: 0,
         combined_stream: Some(combined),
     };
-    pump.resume_from_subscribe(state).await;
+    pump.resume_from_subscribe(state).await.unwrap();
 
     assert_eq!(
         asserter.read_q().len(),
@@ -325,7 +355,7 @@ async fn auto_backfill_skipped_when_s_none_in_resume() {
         first_timestamp: 0,
         combined_stream: Some(combined),
     };
-    pump.resume_from_subscribe(state).await;
+    pump.resume_from_subscribe(state).await.unwrap();
 
     assert_eq!(
         asserter.read_q().len(),
@@ -351,7 +381,7 @@ async fn auto_backfill_skipped_when_s_ge_w_in_resume() {
         first_timestamp: 0,
         combined_stream: Some(combined),
     };
-    pump.resume_from_subscribe(state).await;
+    pump.resume_from_subscribe(state).await.unwrap();
 
     assert_eq!(
         asserter.read_q().len(),

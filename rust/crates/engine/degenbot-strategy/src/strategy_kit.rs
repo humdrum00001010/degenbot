@@ -13,9 +13,9 @@
 //! # Cells
 //!
 //! - **provision** ([`ProvisionCell`]): the single V3 pool-state ingress
-//!   (`Db -> Chain` tick-map precedence, per-block memo) the strategy admits
-//!   through. The boot builds it from the held DB connection and attaches the
-//!   chain arm + chain-sample policy; the verify policy value flows on
+//!   (complete RPC tick snapshots, per-block memo) the strategy admits
+//!   through. The boot attaches the complete snapshot transport and
+//!   chain-sample policy; the verify policy value flows on
 //!   [`PoolIngress::set_verify_level`] (ADR-061 D7).
 //! - **discovery** ([`DiscoveryHandles`]): the frozen route registry and the
 //!   startup discovery graph built from its connector index. `None` keeps the
@@ -27,10 +27,8 @@
 
 use std::sync::Arc;
 
-use degenbot_pools::tick_fetch::TickBootstrapRpc;
-use degenbot_substrate::pool_ingress::{
-    DbArm, IngressWitness, PoolIngress, TickMapPoolIdentity, TickMapSampleVerifier, VerifyLevel,
-};
+use degenbot_rpc::tick_snapshot::TickMapRpc;
+use degenbot_substrate::pool_ingress::{PoolIngress, TickMapSampleVerifier, VerifyLevel};
 use degenbot_substrate::RouteRegistry;
 
 use crate::anchored_dfs::AnchoredGraph;
@@ -39,7 +37,7 @@ use crate::strategy_plane::StrategyName;
 /// The provisioning cell: the one V3 pool-state ingress a strategy admits
 /// through, with the chain arm and chain-sample policy the boot attached.
 pub struct ProvisionCell {
-    /// `Db -> Chain` tick-map admission, memoized per block.
+    /// Complete RPC tick-map admission, memoized per block.
     pub ingress: PoolIngress,
 }
 
@@ -55,7 +53,7 @@ pub struct DiscoveryHandles {
 /// The boot-resolved composition of clustered cells a strategy drives.
 ///
 /// Fields are concrete where variation is hypothetical; `dyn` appears only at
-/// the ingress's real adapter seams (`TickMapDb`, `TickBootstrapRpc`). There
+/// the ingress's real adapter seams (`TickMapRpc`). There
 /// are no defaulted traits: a strategy cannot answer a cell with something it
 /// built itself.
 pub struct StrategyKit {
@@ -63,47 +61,6 @@ pub struct StrategyKit {
     pub provision: ProvisionCell,
     /// Discovery handles; `None` means the fan is shut.
     pub discovery: Option<DiscoveryHandles>,
-}
-
-/// The ingress's backfill witness, written to the offline-review JSONL
-/// capture so a soak can count the pools the Db arm advanced to head.
-struct TraceBackfillWitness;
-
-impl IngressWitness for TraceBackfillWitness {
-    fn db_backfill(
-        &self,
-        identity: TickMapPoolIdentity,
-        from_block: u64,
-        to_block: u64,
-        events: usize,
-    ) {
-        let (family, pool) = match identity {
-            TickMapPoolIdentity::V3(pool) => ("v3", pool),
-            TickMapPoolIdentity::V4 { manager, pool_id } => {
-                return crate::frame_pipeline::trace_jsonl(
-                    "ingress_stage",
-                    serde_json::json!({
-                        "pool": format!("0x{}", alloy::hex::encode(manager)),
-                        "pool_id": pool_id,
-                        "stage": "admit-v4-db-backfill",
-                        "from_block": from_block,
-                        "to_block": to_block,
-                        "events": events,
-                    }),
-                );
-            }
-        };
-        crate::frame_pipeline::trace_jsonl(
-            "ingress_stage",
-            serde_json::json!({
-                "pool": format!("0x{}", alloy::hex::encode(pool)),
-                "stage": format!("admit-{family}-db-backfill"),
-                "from_block": from_block,
-                "to_block": to_block,
-                "events": events,
-            }),
-        );
-    }
 }
 
 impl StrategyKit {
@@ -114,9 +71,8 @@ impl StrategyKit {
     pub const COMPOSED_CELLS: [StrategyCell; 2] =
         [StrategyCell::Provision, StrategyCell::Discovery];
 
-    /// Resolve the kit once at boot: build the ingress over the held DB arm
-    /// (whose paired transport closes any Db-to-head lag), attach the chain arm
-    /// and the chain-sample policy, and build the discovery graph from the
+    /// Resolve the kit once at boot: attach the complete snapshot transport
+    /// and chain-sample policy, and build the discovery graph from the
     /// frozen registry.
     ///
     /// This is the ONE kit resolve site; a strategy composes the result and
@@ -124,14 +80,12 @@ impl StrategyKit {
     #[must_use]
     pub fn resolve(
         registry: Option<Arc<RouteRegistry>>,
-        db: Option<DbArm>,
-        chain: Option<Arc<dyn TickBootstrapRpc>>,
+        chain: Option<Arc<dyn TickMapRpc>>,
         verify: VerifyLevel,
         verifier: Option<Arc<dyn TickMapSampleVerifier>>,
     ) -> Self {
-        let mut ingress = PoolIngress::new(db, chain);
+        let mut ingress = PoolIngress::new(chain);
         ingress.set_verify_level(verify);
-        ingress.set_witness(Arc::new(TraceBackfillWitness));
         if let Some(verifier) = verifier {
             ingress.set_verifier(verifier);
         }

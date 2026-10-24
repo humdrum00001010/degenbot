@@ -308,56 +308,6 @@ def test_pybot_io_probe_pool_type_returns_stableswap_when_coins_answers():
     assert io.probe_pool_type("0x" + "aa" * 20) == PoolProbe.STABLESWAP
 
 
-# === V3 tick bitmap + tick data RPCs (slice 14j) ===
-#
-# `fetch_tick_bitmap` and `fetch_tick_data` move the two parameterized-call
-# sub-choreographies from `_fetch_v3` (tick_data_fetcher.py) into Rust.
-# New pattern: signed-integer argument encoding (int16 for word_position,
-# int24 for tick). The bitmap iteration + dict-building stays Python-side.
-
-
-class _TickDataProvider:
-    """Provider returning canned tickBitmap + ticks responses."""
-
-    def __init__(self, *, bitmap: int, liquidity_gross: int, liquidity_net: int) -> None:
-        self._bitmap = bitmap
-        self._lg = liquidity_gross
-        self._ln = liquidity_net
-        self.calls: list[bytes] = []
-
-    def call(self, to: str, data: bytes, block: int | None = None) -> bytes:
-        self.calls.append(data)
-        sel = data[:4]
-        # tickBitmap(int16) selector = 0x5339c296
-        if sel == function_selector("tickBitmap(int16)"):
-            return to_bytes(abi_encode(types=["uint256"], args=[self._bitmap]))
-        # ticks(int24) selector = 0xf30dba93
-        if sel == function_selector("ticks(int24)"):
-            return to_bytes(abi_encode(types=["uint128", "int128"], args=[self._lg, self._ln]))
-        msg = f"unexpected selector {sel.hex()}"
-        raise ValueError(msg)
-
-
-class _V4TickDataProvider:
-    """Provider returning canned getTickBitmap + getTickLiquidity responses."""
-
-    def __init__(self, *, bitmap: int, liquidity_gross: int, liquidity_net: int) -> None:
-        self._bitmap = bitmap
-        self._lg = liquidity_gross
-        self._ln = liquidity_net
-        self.calls: list[bytes] = []
-
-    def call(self, to: str, data: bytes, block: int | None = None) -> bytes:
-        self.calls.append(data)
-        sel = data[:4]
-        if sel == function_selector("getTickBitmap(bytes32,int16)"):
-            return to_bytes(abi_encode(types=["uint256"], args=[self._bitmap]))
-        if sel == function_selector("getTickLiquidity(bytes32,int24)"):
-            return to_bytes(abi_encode(types=["uint128", "int128"], args=[self._lg, self._ln]))
-        msg = f"unexpected selector {sel.hex()}"
-        raise ValueError(msg)
-
-
 class _BalancerOfflineProbeProvider:
     """An `OfflineProvider` cassette answering the two Balancer sub-type probes.
 

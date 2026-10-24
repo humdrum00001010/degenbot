@@ -100,16 +100,6 @@ name = "updater_replay_bench"
 harness = false
 required-features = ["sql-ledger"]
 
-# The wave-2 EVM-oracle capture generator replays its SQL goldens through the
-# statement-ledger wrapper, so like the bench above it only builds under the
-# `sql-ledger` passthrough — a default-features target sweep (the workspace
-# clippy gate) must skip it instead of dying on E0432
-# (`degenbot_db::sql_ledger` is cfg'd out of degenbot-db).
-# `just check-evm-captures` is the one command that carries the feature.
-[[example]]
-name = "generate_evm_oracle_captures"
-required-features = ["sql-ledger"]
-
 # The wave-3 aave-side adversarial capture generator (ergo HGOV5W) replays its
 # SQL goldens through the statement-ledger wrapper the same way — the same
 # `sql-ledger` passthrough applies.

@@ -200,6 +200,19 @@ async fn composite_routes_call_to_rpc_half() {
     assert_eq!(bytes.as_ref(), &[0xca, 0xfe]);
 }
 
+#[tokio::test]
+async fn unsupported_bulk_tick_rpc_fails_with_method_not_found() {
+    let io = ConstructionIo::new(Arc::new(NoDb), Arc::new(FakeRpc { block_number: 0 }));
+    let error = io
+        .get_tick_maps(&[], alloy::eips::BlockId::number(42))
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        ProviderError::RpcError { code: -32601, .. }
+    ));
+}
+
 // ───────────────────────── NoDb adapter ─────────────────────────
 
 /// `NoDb` returns `None` for every `Option`-returning method, `Vec::new()` for
@@ -325,7 +338,7 @@ async fn degenbot_db_construction_updates_erc20_metadata() {
 
 /// The native RPC adapter against an `OfflineProvider` (no live RPC). Proves
 /// the adapter delegates 1:1 to `AlloyProvider`'s existing methods — mirrors
-/// `tick_assembly/tests.rs`'s offline-provider shape. `get_block_number` +
+/// The offline-provider shape proves `get_block_number` +
 /// `get_block_timestamp` are the two methods derivable from a minimal
 /// recorded fixture.
 #[tokio::test]

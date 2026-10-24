@@ -209,32 +209,17 @@ pub(crate) fn hex_string_to_pool_id(
 /// snapshot-seed surface (the phase / startup ritual lives in `pump.rs`/`solve.rs`).
 #[pymethods]
 impl PyArbEngine {
-    /// The snapshot seed block `S` — set at `Bot.__init__` time by
-    /// `Bot::load_snapshot_from_db` for the DB path, OR via
-    /// [`set_snapshot_seed_block`](Self::set_snapshot_seed_block) for the
-    /// non-DB (file/memory) path (the pyo3 `backfill_from_snapshot`
-    /// is retired; the core auto-backfill inside `BlockPump::resume_from_subscribe`
-    /// reads `S` from the shared `BotState`). `None` = cold-start (no snapshot
-    /// loaded).
+    /// Earliest registered complete pool snapshot, widened by an explicit
+    /// manual replay boundary. The pump replays through the WebSocket anchor.
     #[getter]
     fn snapshot_seed_block(&self, py: Python<'_>) -> Option<u64> {
         // GIL hygiene: guards acquired inside the accessor's py.detach.
         self.with_core(py, |s| s.cl().snapshot_seed_block())
     }
 
-    /// Set the snapshot seed block `S` on the shared `BotState` for the
-    /// non-DB (file/memory) snapshot path.
-    ///
-    /// The DB path (`Bot::load_snapshot_from_db`) sets `S` itself; the
-    /// non-DB path calls this once after `load_v3_snapshot_from_py` /
-    /// `load_v4_snapshot_from_py` so the shared `BotState` carries `S =
-    /// min(newest_block_v3, newest_block_v4)` — the seed the core
-    /// auto-backfill closes the snapshot→WS gap from.
-    ///
-    /// `None` clears the seed (cold-start resume); `Some(b)` overrides the
-    /// stored seed (used only when no snapshot has set it yet — the DB path's
-    /// already-set seed takes precedence on the production path because the
-    /// non-DB path does not call this setter).
+    /// Set a replay boundary for manually supplied state. It can widen the
+    /// startup gap but cannot advance past or clear registered pool snapshots.
+    /// None clears only this manual boundary.
     #[setter]
     fn set_snapshot_seed_block(&self, py: Python<'_>, block: Option<u64>) {
         // GIL hygiene: write guard acquired inside the accessor's py.detach.

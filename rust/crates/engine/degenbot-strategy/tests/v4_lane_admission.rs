@@ -14,12 +14,15 @@
     clippy::similar_names
 )]
 
-use alloy::primitives::{address, aliases::U112, Address, B256, I256, U256};
+use alloy::primitives::{address, aliases::U112, Address, B256, U256};
 
+use degenbot_core::errors::ProviderResult;
 use degenbot_db::connection::DegenbotDb;
-use degenbot_db::{ApplyBitmapAtWord, ApplyLiquidityAtTick};
 use degenbot_pools::slot_layout::V2ReservesParts;
 use degenbot_rpc::liquidity_verifier::LiquidityMap as RpcLiquidityMap;
+use degenbot_rpc::tick_snapshot::{
+    PoolTickSnapshot, SnapshotTick, TickMapRequest, TickMapRpc, TickMapSnapshot,
+};
 use degenbot_simulation::sim::evm::journal_pools::{
     PoolFamily, PoolPostKind, PoolPostState, TouchedTickWord, TypedPoolPost, V4PoolSet,
 };
@@ -30,35 +33,64 @@ use degenbot_strategy::ETHEREUM_WETH as WETH;
 use degenbot_substrate::connector_index::{V2ConnectorIndex, V2Edge, V4Edge};
 use degenbot_substrate::executor_hop::V2FeePair;
 use degenbot_substrate::pool_ingress::{TickMapSampleTarget, TickMapSampleVerifier, VerifyLevel};
-use hashbrown::HashMap as HbMap;
 
 fn v2_fee_pair() -> V2FeePair {
     V2FeePair::from_discovered(Some(3), Some(3), Some(1_000))
 }
 
-/// Test stand-in for the Db→head backfill transport. The fixtures stamp no
-/// `liquidity_update_block`, so no window is ever backfilled; an unexpected
-/// fetch declines loudly rather than staging stale state.
-struct NoBackfill;
+struct SnapshotRpc;
 
-impl degenbot_substrate::pool_ingress::LiquidityLogSource for NoBackfill {
-    fn fetch_v3_liquidity_events(
-        &self,
-        _pool: alloy::primitives::Address,
-        _from: u64,
-        _to: u64,
-    ) -> Result<Vec<degenbot_db::LiquidityUpdateEvent>, String> {
-        Err("this fixture wires no backfill transport".into())
-    }
-
-    fn fetch_v4_liquidity_events(
-        &self,
-        _manager: alloy::primitives::Address,
-        _pool_id: alloy::primitives::B256,
-        _from: u64,
-        _to: u64,
-    ) -> Result<Vec<degenbot_db::LiquidityUpdateEvent>, String> {
-        Err("this fixture wires no backfill transport".into())
+impl TickMapRpc for SnapshotRpc {
+    fn get_tick_maps<'a>(
+        &'a self,
+        requests: &'a [TickMapRequest],
+        block: alloy::eips::BlockId,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = ProviderResult<TickMapSnapshot>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            Ok(TickMapSnapshot {
+                chain_id: 1,
+                block_number: block.as_u64().unwrap(),
+                block_hash: B256::repeat_byte(9),
+                pools: requests
+                    .iter()
+                    .map(|request| PoolTickSnapshot {
+                        address: request.address,
+                        protocol: request.protocol,
+                        pool_id: request.pool_id,
+                        tick_spacing: request.tick_spacing,
+                        tick: 0,
+                        sqrt_price_x96: U256::from(1u128) << 96,
+                        liquidity: 1_000_000_000,
+                        protocol_fee: 0,
+                        lp_fee: 500,
+                        ticks: vec![
+                            SnapshotTick {
+                                tick: -240,
+                                liquidity_gross: 1_000_004_000,
+                                liquidity_net: 1_000_004_000,
+                            },
+                            SnapshotTick {
+                                tick: -120,
+                                liquidity_gross: 8_000,
+                                liquidity_net: -4_000,
+                            },
+                            SnapshotTick {
+                                tick: 120,
+                                liquidity_gross: 10_000,
+                                liquidity_net: 5_000,
+                            },
+                            SnapshotTick {
+                                tick: 240,
+                                liquidity_gross: 1_000_005_000,
+                                liquidity_net: -1_000_005_000,
+                            },
+                        ],
+                    })
+                    .collect(),
+            })
+        })
     }
 }
 
@@ -68,11 +100,11 @@ fn market_context(
     verify: VerifyLevel,
     verifier: Option<std::sync::Arc<dyn TickMapSampleVerifier>>,
 ) -> MarketContext {
-    let db_arm = db.clone().map(|db| {
-        degenbot_substrate::pool_ingress::DbArm::new(db, std::sync::Arc::new(NoBackfill))
-    });
     let kit = degenbot_strategy::strategy_kit::StrategyKit::resolve(
-        registry, db_arm, None, verify, verifier,
+        registry,
+        Some(std::sync::Arc::new(SnapshotRpc)),
+        verify,
+        verifier,
     );
     MarketContext::new(1, db, kit, 8, 4)
 }
@@ -147,42 +179,6 @@ fn runtime_fixture_with(
         ))
         .unwrap();
     }
-    let mut ticks = HbMap::new();
-    ticks.insert(
-        -120,
-        ApplyLiquidityAtTick {
-            liquidity_net: I256::try_from(-4_000_i64).unwrap(),
-            liquidity_gross: alloy::primitives::U128::from(8_000_u64),
-            block: 0,
-        },
-    );
-    ticks.insert(
-        120,
-        ApplyLiquidityAtTick {
-            liquidity_net: I256::try_from(5_000_i64).unwrap(),
-            liquidity_gross: alloy::primitives::U128::from(10_000_u64),
-            block: 0,
-        },
-    );
-    let mut bitmaps = HbMap::new();
-    bitmaps.insert(
-        -1,
-        ApplyBitmapAtWord {
-            bitmap: U256::from(1_u8) << 244,
-            block: 0,
-        },
-    );
-    bitmaps.insert(
-        0,
-        ApplyBitmapAtWord {
-            bitmap: U256::from(1_u8) << 12,
-            block: 0,
-        },
-    );
-    db.upsert_v4_liquidity_positions(i64::try_from(V4_DB_POOL_ID).unwrap(), &ticks)
-        .unwrap();
-    db.upsert_v4_initialization_maps(i64::try_from(V4_DB_POOL_ID).unwrap(), &bitmaps)
-        .unwrap();
     market_context(
         Some(std::sync::Arc::new(degenbot_substrate::RouteRegistry::new(
             index,

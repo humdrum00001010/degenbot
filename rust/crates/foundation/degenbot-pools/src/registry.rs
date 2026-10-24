@@ -703,6 +703,9 @@ impl ConcentratedLiquidityPoolMut for V3PoolState {
         block_number: u64,
         tick_priors: &[(i32, TickInfo)],
     ) {
+        if block_number <= self.initial_state_block {
+            return;
+        }
         let mut journaled_priors: Vec<(i32, TickBefore)> = Vec::with_capacity(tick_priors.len());
         for &(tick_index, ref new_info) in tick_priors {
             let prior = self.tick_data.get(&tick_index).cloned();
@@ -737,22 +740,8 @@ impl ConcentratedLiquidityPoolMut for V3PoolState {
         self.sqrt_price_x96 = sqrt_price_x96;
         self.liquidity = liquidity;
         self.tick = tick;
-        // A Swap arrives LIVE (block > seed) in the steady state or as a
-        // backfill replay (block <= seed). Live applies are STRICT monotonic
-        // (a backward stamp outside a reorg panics); backfill replays drain
-        // older events and are a sanctioned monotonic no-op on clocks they
-        // already cover (never rewind a head-fresh pool below seed).
-        if block_number > self.initial_state_block {
-            self.advance_update_block(block_number);
-            self.advance_tick_data_block(block_number);
-        } else {
-            if block_number > self.update_block {
-                self.update_block = block_number;
-            }
-            if block_number > self.tick_data_block {
-                self.tick_data_block = block_number;
-            }
-        }
+        self.advance_update_block(block_number);
+        self.advance_tick_data_block(block_number);
         self.state_nonce = self.state_nonce.wrapping_add(1);
         // Only invalidate the tick-range cache when the swap actually
         // changes the walk inputs (tick_data via tick_priors, or current
@@ -772,13 +761,19 @@ impl ConcentratedLiquidityPoolMut for V3PoolState {
         liquidity_delta: i128,
         block_number: u64,
     ) {
+        if self
+            .initial_tick_data_block
+            .is_some_and(|seed| block_number <= seed)
+        {
+            return;
+        }
         // Historical-replay guard (the Python `_initial_state_block` guard):
         // only a genuinely in-range event STRICTLY AFTER the seed block adjusts
         // the active-liquidity scalar. The seed's `liquidity` already reflects
         // every on-chain event <= initial_state_block, so replaying one (e.g. a
         // backfilled Burn applied after registration against head) would
-        // double-count it. Such a replay still mutates the tick map, but the
-        // scalar write-back + journal stay tick-only (scalar_priors: None).
+        // double-count it. A replay newer than the complete-map seed mutates
+        // ticks only; the scalar write-back + journal stay tick-only.
         let in_range = tick_lower <= self.tick
             && self.tick < tick_upper
             && block_number > self.initial_state_block;
@@ -907,6 +902,9 @@ impl ConcentratedLiquidityPoolMut for V4PoolState {
         block_number: u64,
         tick_priors: &[(i32, TickInfo)],
     ) {
+        if block_number <= self.initial_state_block {
+            return;
+        }
         let mut journaled_priors: Vec<(i32, TickBefore)> = Vec::with_capacity(tick_priors.len());
         for &(tick_index, ref new_info) in tick_priors {
             let prior = self.tick_data.get(&tick_index).cloned();
@@ -941,22 +939,8 @@ impl ConcentratedLiquidityPoolMut for V4PoolState {
         self.sqrt_price_x96 = sqrt_price_x96;
         self.liquidity = liquidity;
         self.tick = tick;
-        // A Swap arrives LIVE (block > seed) in the steady state or as a
-        // backfill replay (block <= seed). Live applies are STRICT monotonic
-        // (a backward stamp outside a reorg panics); backfill replays drain
-        // older events and are a sanctioned monotonic no-op on clocks they
-        // already cover (never rewind a head-fresh pool below seed).
-        if block_number > self.initial_state_block {
-            self.advance_update_block(block_number);
-            self.advance_tick_data_block(block_number);
-        } else {
-            if block_number > self.update_block {
-                self.update_block = block_number;
-            }
-            if block_number > self.tick_data_block {
-                self.tick_data_block = block_number;
-            }
-        }
+        self.advance_update_block(block_number);
+        self.advance_tick_data_block(block_number);
         self.state_nonce = self.state_nonce.wrapping_add(1);
         // Only invalidate the tick-range cache when the swap actually
         // changes the walk inputs (tick_data via tick_priors, or current
@@ -976,6 +960,12 @@ impl ConcentratedLiquidityPoolMut for V4PoolState {
         liquidity_delta: i128,
         block_number: u64,
     ) {
+        if self
+            .initial_tick_data_block
+            .is_some_and(|seed| block_number <= seed)
+        {
+            return;
+        }
         let in_range = tick_lower <= self.tick
             && self.tick < tick_upper
             && block_number > self.initial_state_block;

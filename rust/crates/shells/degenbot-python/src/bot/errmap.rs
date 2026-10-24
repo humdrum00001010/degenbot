@@ -73,7 +73,7 @@ pub(crate) fn map_verify_lifecycle_error(err: VerifyError) -> PyErr {
             VerificationRpcError::new_err(message)
         }
         VerifyError::Other(message) => PyRuntimeError::new_err(message),
-        other => PyRuntimeError::new_err(other.to_string()),
+        error @ VerifyError::NotConfigured(_) => PyRuntimeError::new_err(error.to_string()),
     }
 }
 
@@ -235,9 +235,6 @@ pub(crate) fn map_builder_err(
         }
         PoolBuilderError::MissingIdentity { message } => {
             PyValueError::new_err(format!("V4 identity incomplete: {message}"))
-        }
-        PoolBuilderError::TickAssembly(e) => {
-            PyValueError::new_err(format!("Tracked tick map rejected at intake: {e}"))
         }
     }
 }

@@ -13,7 +13,7 @@
 //! ## Supported RPCs
 //!
 //! Mirrors the Python interface: `eth_call`, `eth_getCode`, `eth_blockNumber`,
-//! `eth_getBlockByNumber`. The Python impl raised `NotImplementedError` for
+//! `eth_getBlockByNumber`, and explicitly recorded `erigon_getTickMaps`. The Python impl raised `NotImplementedError` for
 //! balance / storage / nonce / logs — those surface here as
 //! [`TransportErrorKind`] "method not found" (non-revert RPC error), preserving
 //! the "unsupported" contract without panicking.
@@ -55,6 +55,12 @@ pub struct RecordedBlock {
     /// The block timestamp (Unix seconds), recorded as a plain integer.
     #[serde(default)]
     pub timestamp: u64,
+    /// Canonical identity supplied by a recorded block header.
+    #[serde(default)]
+    pub hash: Option<B256>,
+    /// Complete Erigon response, never synthesized from individual getter calls.
+    #[serde(default)]
+    pub tick_maps: Option<serde_json::Value>,
     /// `"to_lower:0x<data_hex>"` → result hex (**without** `0x` prefix) or
     /// `None` for a recorded revert.
     #[serde(default)]
@@ -74,6 +80,10 @@ struct RecordedData {
     block_number: Option<u64>,
     #[serde(default)]
     timestamp: Option<u64>,
+    #[serde(default)]
+    hash: Option<B256>,
+    #[serde(default)]
+    tick_maps: Option<serde_json::Value>,
     #[serde(default)]
     calls: Option<HashMap<String, Option<String>>>,
     #[serde(default)]
@@ -129,6 +139,8 @@ impl OfflineProvider {
                 n,
                 RecordedBlock {
                     timestamp: data.timestamp.unwrap_or(0),
+                    hash: data.hash,
+                    tick_maps: data.tick_maps,
                     calls: data.calls.unwrap_or_default(),
                     code: data.code.unwrap_or_default(),
                 },
@@ -192,6 +204,15 @@ impl OfflineProvider {
                         .filter(|n| self.blocks.contains_key(n))
                 }
             }
+            Some(serde_json::Value::Object(selector)) => {
+                let hash = selector.get("blockHash")?.as_str()?.parse::<B256>().ok()?;
+                if hash == B256::ZERO || selector.contains_key("blockNumber") {
+                    return None;
+                }
+                self.blocks
+                    .iter()
+                    .find_map(|(&number, block)| (block.hash == Some(hash)).then_some(number))
+            }
             Some(serde_json::Value::Number(n)) => {
                 n.as_u64().filter(|n| self.blocks.contains_key(n))
             }
@@ -240,16 +261,43 @@ impl OfflineTransport {
             .and_then(|rv| serde_json::from_str::<serde_json::Value>(rv.get()).ok())
             .unwrap_or(serde_json::Value::Null);
         let payload = match req.method() {
+            "eth_chainId" => success(&format!("0x{:x}", self.data.chain_id)),
             "eth_blockNumber" => self.block_number(),
             "eth_getCode" => self.get_code(&params),
             "eth_call" => self.eth_call(&params),
             "eth_getBlockByNumber" => self.get_block_by_number(&params),
+            "erigon_getTickMaps" => self.tick_maps(&params),
             _ => Err(method_not_found(req.method())),
         };
         Response {
             id,
             payload: payload.unwrap_or_else(ResponsePayload::Failure),
         }
+    }
+
+    fn tick_maps(&self, params: &serde_json::Value) -> Result<ResponsePayload, ErrorPayload> {
+        let selector = params
+            .get(1)
+            .ok_or_else(|| invalid_params("tick maps block selector"))?;
+        if !selector.is_object()
+            && !selector.is_u64()
+            && !selector.as_str().is_some_and(|s| s.starts_with("0x"))
+        {
+            return Err(invalid_params(
+                "tick maps require an explicit recorded block",
+            ));
+        }
+        let number = self
+            .data
+            .resolve_block(Some(selector))
+            .ok_or_else(|| block_not_recorded_msg(Some(selector)))?;
+        let payload = self
+            .data
+            .blocks
+            .get(&number)
+            .and_then(|block| block.tick_maps.as_ref())
+            .ok_or_else(|| invalid_params("erigon_getTickMaps response not recorded"))?;
+        success(payload)
     }
 
     fn block_number(&self) -> Result<ResponsePayload, ErrorPayload> {
@@ -335,7 +383,7 @@ impl OfflineTransport {
             .blocks
             .get(&block)
             .expect("resolve_block only returns recorded block numbers");
-        success_block(block, block_data.timestamp)
+        success_block(block, block_data.timestamp, block_data.hash)
     }
 }
 
@@ -375,7 +423,11 @@ fn success_null() -> ResponsePayload {
 }
 
 /// Build the JSON-RPC block object for an `eth_getBlockByNumber` response.
-fn success_block(number: u64, timestamp: u64) -> Result<ResponsePayload, ErrorPayload> {
+fn success_block(
+    number: u64,
+    timestamp: u64,
+    hash: Option<B256>,
+) -> Result<ResponsePayload, ErrorPayload> {
     let consensus = ConsensusHeader {
         number,
         timestamp,
@@ -387,7 +439,7 @@ fn success_block(number: u64, timestamp: u64) -> Result<ResponsePayload, ErrorPa
         ..Default::default()
     };
     let header = RpcHeader {
-        hash: B256::ZERO,
+        hash: hash.unwrap_or(B256::ZERO),
         inner: consensus,
         total_difficulty: None,
         size: None,
@@ -479,6 +531,73 @@ fn revert_data(_to: &str, _data: &str) -> Option<Box<RawValue>> {
 mod tests {
     use super::*;
     use alloy::primitives::{address, U256};
+
+    #[tokio::test]
+    async fn tick_maps_use_exact_recorded_hash_and_refuse_missing_responses() {
+        use crate::tick_snapshot::{TickMapProtocol, TickMapRequest};
+        use alloy::eips::{BlockId, RpcBlockHash};
+
+        let hash = B256::repeat_byte(0x11);
+        let request = TickMapRequest {
+            address: alloy::primitives::Address::repeat_byte(0x34),
+            protocol: TickMapProtocol::UniswapV3,
+            tick_spacing: 60,
+            pool_id: None,
+        };
+        let snapshot = serde_json::json!({
+            "chainId": "0x89", "blockNumber": "0x64", "blockHash": hash,
+            "pools": [{
+                "address": request.address, "protocol": "uniswapV3", "tickSpacing": 60,
+                "tick": 0, "sqrtPriceX96": "0x1000000000000000000000000",
+                "liquidity": "0x0", "protocolFee": 0, "lpFee": 3000, "ticks": []
+            }]
+        });
+        let source = serde_json::json!({"chain_id": 137, "blocks": {
+            "100": {"hash": hash, "tick_maps": snapshot},
+            "200": {"hash": B256::repeat_byte(0x22)}
+        }});
+        let provider = OfflineProvider::from_json_str(&source.to_string())
+            .unwrap()
+            .as_alloy_provider();
+        assert_eq!(
+            provider.get_block(100).await.unwrap().unwrap().header.hash,
+            hash
+        );
+        let response = provider
+            .get_tick_maps(
+                &[request],
+                BlockId::Hash(RpcBlockHash {
+                    block_hash: hash,
+                    require_canonical: Some(true),
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            (
+                response.chain_id,
+                response.block_number,
+                response.block_hash
+            ),
+            (137, 100, hash)
+        );
+        assert!(response.pools[0].ticks.is_empty());
+        assert!(provider
+            .get_tick_maps(&[request], 200.into())
+            .await
+            .is_err());
+        for selector in [
+            serde_json::json!({"blockHash": B256::repeat_byte(0x33), "requireCanonical": true}),
+            serde_json::json!({"blockHash": hash, "blockNumber": "0xc8"}),
+            serde_json::json!("pending"),
+            serde_json::json!("0xc8"),
+        ] {
+            assert!(provider
+                .make_request("erigon_getTickMaps", serde_json::json!([[], selector]))
+                .await
+                .is_err());
+        }
+    }
 
     /// A recorded single-block fixture in the same shape the Python
     /// `OfflineProvider` records/consumes.

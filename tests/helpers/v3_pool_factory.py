@@ -134,17 +134,10 @@ def make_v3_pool(
     handle: Pool | None = bot.get_pool(pool_id)
     assert handle is not None, "register_v3_pool returned a pool_id with no handle"
 
-    # ``apply_swap`` anchors the reorg genesis delta at state_block (mirrors
-    # the V2 builder writing reserves with update_block=state_block). The
-    # tick_data seed landed inline in ``register_v3_pool`` — no separate
-    # ``update_tick_data`` call (that would clobber pump-applied events).
+    # The registration snapshot must remain a known journal boundary before
+    # post-seed events arrive.
     if state_block is not None and state_block_int > 0:
-        handle.apply_swap(
-            sqrt_price_x96=sqrt_price_x96,
-            liquidity=liquidity,
-            tick=tick,
-            block_number=state_block_int,
-        )
+        handle.seed_genesis(block_number=state_block_int)
 
     # ADR-006: the pool's tokens must live in the SAME Bot as
     # the pool — ``from_handle`` recovers them via ``py_pool.get_token0``/

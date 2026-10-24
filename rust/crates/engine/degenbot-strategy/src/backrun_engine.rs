@@ -54,7 +54,7 @@ pub enum V2AdmissionError {
 /// never touches the mainline pump's registry). Admission, staging,
 /// declaration, and evaluation delegate to the workspace; the lane owns the
 /// slot0/liquidity reads and live reserves that PRODUCE the explicit state,
-/// while the V3 tick map comes from the ingress (`Db → Chain`).
+/// while the V3 tick map comes from the complete snapshot ingress.
 pub struct BackrunSolver {
     ws: Workspace,
 }
@@ -177,8 +177,8 @@ impl Default for BackrunSolver {
 }
 
 /// Why a cold-connector V3 hop could not be admitted: the ingress decline
-/// names the refused step (`slot0` fetch/width, the Db arm, the Chain-arm
-/// tick-map bootstrap, or registration), so the per-hop JSONL trace
+/// names the refused step (scalar read, complete tick-map fetch, sampling,
+/// or registration), so the per-hop JSONL trace
 /// distinguishes a network/spec failure from a registration refusal (an
 /// `AlreadyRegistered` duplicate is a different beast from a dead
 /// archive-node call and must not share one opaque label).
@@ -317,7 +317,7 @@ pub struct LaneCandidate {
 
 impl BackrunSolver {
     /// Admit a replayed V3 post-state through the policy-enforcing ingress.
-    /// The ingress owns Db/Chain staging, overlay merge, bitmap provenance,
+    /// The ingress owns complete snapshot staging, overlay merge, bitmap provenance,
     /// verification, and registration; this method only carries the typed
     /// replay facts and the workspace boundary.
     ///
@@ -364,7 +364,7 @@ impl BackrunSolver {
     }
 
     /// Admit a replayed V4 post-state through the policy-enforcing ingress.
-    /// The ingress owns Db→Chain staging, Db-to-head backfill, bitmap merge,
+    /// The ingress owns complete snapshot staging, bitmap merge,
     /// verification, and registration; this method carries only typed replay
     /// facts and the workspace boundary.
     ///
@@ -378,7 +378,6 @@ impl BackrunSolver {
     pub async fn admit_v4_replay(
         &mut self,
         manager: Address,
-        state_view: Option<Address>,
         token0: Address,
         token1: Address,
         pool_id: B256,
@@ -397,7 +396,6 @@ impl BackrunSolver {
                 &mut self.ws,
                 IngressV4Params {
                     manager,
-                    state_view,
                     pool_id,
                     token0,
                     token1,
@@ -414,11 +412,8 @@ impl BackrunSolver {
             .await
     }
 
-    /// Register a V3 pool at HEAD through the ingress, optionally OVERRIDING
-    /// `sqrt_price_x96` with the post-target staged price (the
-    /// V3-affected-pool path). The slot0/liquidity scalars are read here
-    /// through the caller's `slot_layout`; the tick map is the ingress's
-    /// `Db → Chain` responsibility — this lane never reads a tick word.
+    /// Register a cold V3 pool with scalar and complete-map reads pinned to
+    /// the same head. Replayed scalar state enters through `admit_v3_replay`.
     ///
     /// # Errors
     ///
@@ -435,13 +430,12 @@ impl BackrunSolver {
         token1: Address,
         fee: u32,
         tick_spacing: i32,
-        sqrt_override: Option<U256>,
         head: u64,
         slot_layout: ClSlotLayout,
         ingress: &PoolIngress,
     ) -> Result<u64, V3LadderReject> {
         let (sqrt_price_x96, tick, liquidity) =
-            degenbot_rpc::abi::fetch_v3_slot0_liquidity(provider, &address, None)
+            degenbot_rpc::abi::fetch_v3_slot0_liquidity(provider, &address, Some(head))
                 .await
                 .map_err(|e| V3LadderReject::Slot0Fetch(e.to_string()))?;
         let liquidity = u128::try_from(liquidity).map_err(|_| V3LadderReject::Slot0Width)?;
@@ -455,7 +449,7 @@ impl BackrunSolver {
                     token1,
                     fee,
                     tick_spacing,
-                    sqrt_price_x96: sqrt_override.unwrap_or(sqrt_price_x96),
+                    sqrt_price_x96,
                     liquidity,
                     tick: tick_i32,
                     slot_layout,
@@ -497,8 +491,8 @@ mod tests {
             "admit-v3-tick-map-fetch"
         );
         assert_eq!(
-            V3LadderReject::Db("database is locked".into()).stage(),
-            "admit-v3-db"
+            V3LadderReject::TickMapFetch("snapshot unavailable".into()).stage(),
+            "admit-v3-tick-map-fetch"
         );
         let reg = V3LadderReject::Register("AlreadyRegistered { 0xb001 }".into());
         assert_eq!(reg.stage(), "admit-v3-register");

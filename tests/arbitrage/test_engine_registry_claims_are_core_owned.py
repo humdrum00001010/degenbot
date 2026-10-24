@@ -49,13 +49,11 @@ class _CountingFakeEngine:
         # before returning: the overlap is arranged, not scheduled.
         self._lifecycle_gate = lifecycle_gate
 
-    async def run_v3_registration_lifecycle(self, address: str, snapshot_block: object) -> None:
+    async def run_v3_registration_lifecycle(self, address: str) -> None:
         self.v3_lifecycle_calls += 1
         await self._hold_for_overlap()
 
-    async def run_v4_registration_lifecycle(
-        self, address: str, pool_id_hex: str, snapshot_block: object
-    ) -> None:
+    async def run_v4_registration_lifecycle(self, address: str, pool_id_hex: str) -> None:
         self.v4_lifecycle_calls += 1
         await self._hold_for_overlap()
 
@@ -141,9 +139,7 @@ async def test_concurrent_v3_registrations_dispatch_one_core_lifecycle_each() ->
     assert engine.v3_lifecycle_calls == N_WORKERS, (
         "each registration enters the core claim; the core decides at-most-once"
     )
-    assert set(results) == {V3_POOL_ID}, (
-        "every worker reads the same core-owned pool id"
-    )
+    assert set(results) == {V3_POOL_ID}, "every worker reads the same core-owned pool id"
 
 
 async def test_concurrent_v4_registrations_dispatch_one_core_lifecycle_each() -> None:
@@ -168,11 +164,9 @@ async def test_v4_registration_passes_the_manager_and_pool_id_pair() -> None:
     seen: list[tuple[str, str]] = []
 
     class _Recorder(_CountingFakeEngine):
-        async def run_v4_registration_lifecycle(
-            self, address: str, pool_id_hex: str, snapshot_block: object
-        ) -> None:
+        async def run_v4_registration_lifecycle(self, address: str, pool_id_hex: str) -> None:
             seen.append((address, pool_id_hex))
-            await super().run_v4_registration_lifecycle(address, pool_id_hex, snapshot_block)
+            await super().run_v4_registration_lifecycle(address, pool_id_hex)
 
     registry = EngineRegistry(engine=_Recorder())  # type: ignore[arg-type]
     pool = _fake_v4_pool(V4_POOL_ID)

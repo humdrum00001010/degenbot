@@ -17,33 +17,30 @@ impl PyArbEngine {
     /// immediate no-op (`Live`, no RPC); **Tracked** → verified with the
     /// mismatch tripwire before `Live`. Uses the bot's single verify provider
     /// (D-B).
-    #[pyo3(signature = (address, snapshot_block))]
+    #[pyo3(signature = (address))]
     fn run_v3_registration_lifecycle<'py>(
         &self,
         py: Python<'py>,
         address: &str,
-        snapshot_block: Option<u64>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        crate::bot::pump::run_v3_registration_lifecycle(py, &self.driver, address, snapshot_block)
+        crate::bot::pump::run_v3_registration_lifecycle(py, &self.driver, address)
     }
 
     /// V4 twin of `run_v3_registration_lifecycle`, keyed by
     /// (`pool_manager_address`, `pool_id_hex`). A tracked V4 pool with no
     /// `verify_state_view` configured fails fast (`PyValueError`, D-C).
-    #[pyo3(signature = (pool_manager_address, pool_id_hex, snapshot_block))]
+    #[pyo3(signature = (pool_manager_address, pool_id_hex))]
     fn run_v4_registration_lifecycle<'py>(
         &self,
         py: Python<'py>,
         pool_manager_address: &str,
         pool_id_hex: &str,
-        snapshot_block: Option<u64>,
     ) -> PyResult<Bound<'py, PyAny>> {
         crate::bot::pump::run_v4_registration_lifecycle(
             py,
             &self.driver,
             pool_manager_address,
             pool_id_hex,
-            snapshot_block,
         )
     }
 
@@ -53,36 +50,24 @@ impl PyArbEngine {
     /// choreography parked on the shared tokio runtime via `block_on` inside
     /// `py.detach`. Telemetry + typed errors are identical to the async twin;
     /// only the park shape differs.
-    #[pyo3(signature = (address, snapshot_block))]
-    fn run_v3_registration_lifecycle_sync(
-        &self,
-        py: Python<'_>,
-        address: &str,
-        snapshot_block: Option<u64>,
-    ) -> PyResult<()> {
-        crate::bot::pump::run_v3_registration_lifecycle_blocking(
-            py,
-            &self.driver,
-            address,
-            snapshot_block,
-        )
+    #[pyo3(signature = (address))]
+    fn run_v3_registration_lifecycle_sync(&self, py: Python<'_>, address: &str) -> PyResult<()> {
+        crate::bot::pump::run_v3_registration_lifecycle_blocking(py, &self.driver, address)
     }
 
     /// Blocking (seat-thread) V4 twin of `run_v3_registration_lifecycle_sync`.
-    #[pyo3(signature = (pool_manager_address, pool_id_hex, snapshot_block))]
+    #[pyo3(signature = (pool_manager_address, pool_id_hex))]
     fn run_v4_registration_lifecycle_sync(
         &self,
         py: Python<'_>,
         pool_manager_address: &str,
         pool_id_hex: &str,
-        snapshot_block: Option<u64>,
     ) -> PyResult<()> {
         crate::bot::pump::run_v4_registration_lifecycle_blocking(
             py,
             &self.driver,
             pool_manager_address,
             pool_id_hex,
-            snapshot_block,
         )
     }
 
@@ -92,31 +77,28 @@ impl PyArbEngine {
     /// classification (transient RPC/provider vs fatal mismatch) is core-owned.
     /// A transient failure releases the lifecycle claim, so a retry re-runs the
     /// whole choreography.
-    #[pyo3(signature = (address, snapshot_block, policy))]
+    #[pyo3(signature = (address, policy))]
     fn run_v3_registration_lifecycle_with_retry_sync(
         &self,
         py: Python<'_>,
         address: &str,
-        snapshot_block: Option<u64>,
         policy: &crate::config::RetryPolicy,
     ) -> PyResult<()> {
         crate::bot::pump::run_v3_registration_lifecycle_with_retry_blocking(
             py,
             &self.driver,
             address,
-            snapshot_block,
             policy,
         )
     }
 
     /// Blocking V4 verify-lifecycle under the core-owned bounded retry dance.
-    #[pyo3(signature = (pool_manager_address, pool_id_hex, snapshot_block, policy))]
+    #[pyo3(signature = (pool_manager_address, pool_id_hex, policy))]
     fn run_v4_registration_lifecycle_with_retry_sync(
         &self,
         py: Python<'_>,
         pool_manager_address: &str,
         pool_id_hex: &str,
-        snapshot_block: Option<u64>,
         policy: &crate::config::RetryPolicy,
     ) -> PyResult<()> {
         crate::bot::pump::run_v4_registration_lifecycle_with_retry_blocking(
@@ -124,7 +106,6 @@ impl PyArbEngine {
             &self.driver,
             pool_manager_address,
             pool_id_hex,
-            snapshot_block,
             policy,
         )
     }

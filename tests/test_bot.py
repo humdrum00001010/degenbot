@@ -13,8 +13,8 @@ the installed typed config, matching the runner's injectable actors and the
   ``resolve_*`` / ``get_provider_from_config`` module factories.
 - ``Bot(py_bot=..., io=..., erc20_builder=...)`` — engine / I/O / token-builder
   doubles for the build-path tests. An injected object skips the
-  construction-time wiring that belongs to the default instance (engine DB
-  snapshot load + ``ConstructionIo`` attach; ``BotIo`` ``ConstructionIo``
+  construction-time wiring that belongs to the default instance (engine
+  ``ConstructionIo`` attach; ``BotIo`` ``ConstructionIo``
   attach), so the doubles need no spec scaffolding.
 - The V2/V4 parity tests drive the PUBLIC build entries (``build_pool`` /
   ``build_managed_pool``), which reach the same delegated-build parity guards
@@ -28,9 +28,6 @@ Rejected alternatives:
   unregistered factory, and a probe answer of V2) — the extra choreography is
   the same public surface the facade itself exercises, so the test covers the
   dispatch into the delegated path at no assertion cost.
-- Stubbing ``_make_v4_tick_data_fetcher`` proved unnecessary: the real
-  factory is lazy (no I/O at creation) and its closure is never invoked on
-  the parity-mismatch path, so the real one runs untouched.
 - ``MagicMock(spec=AlloyProvider)`` provider doubles: nothing on the paths
   under test touches the provider beyond ``chain_id``, so the real
   ``OfflineProvider`` (recorded JSON, no RPC at construction) is both

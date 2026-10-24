@@ -184,17 +184,8 @@ test-timing top='30':
 bench-updaters:
     cargo bench --locked --manifest-path rust/Cargo.toml -p degenbot --features degenbot/sql-ledger --bench updater_replay_bench
 
-# The wave-2 EVM-oracle capture generator's gate (LCRP37): regenerate the
-# wave-2 cassettes + SQL goldens into a temp home and exit 1 on any byte
-# drift against the committed artifacts. The example only builds under the
-# `sql-ledger` passthrough (its [[example]] required-features, same shape as
-# the updater_replay_bench [[bench]] entry above) — this recipe is the one
-# command that carries the feature.
-check-evm-captures:
-    cargo run --locked --manifest-path rust/Cargo.toml -p degenbot --features degenbot/sql-ledger --example generate_evm_oracle_captures -- --check tests/fixtures/cassettes/wave2 tests/fixtures/sql_goldens/wave2
-
 # The wave-3 aave-side adversarial capture generator's gate (HGOV5W): the
-# same drift gate as check-evm-captures over the wave-3 fixture homes.
+# Regenerate the wave-3 fixtures and compare against committed artifacts.
 check-aave-captures:
     cargo run --locked --manifest-path rust/Cargo.toml -p degenbot --features degenbot/sql-ledger --example generate_aave_adversarial_captures -- --check tests/fixtures/cassettes/wave3 tests/fixtures/sql_goldens/wave3
 
@@ -393,8 +384,8 @@ rebuild-if-stale:
 # default offline marker filter (`-m "not slow and not base and not online_rpc"`)
 # this covers the PyO3 seam, golden on-chain-oracle replay, AND the relocated
 # seam suites. A focused parity-only run is `uv run --no-sync pytest -m onchain_oracle`.
-test-python:
-    uv run --no-sync pytest -x -q --no-header
+test-python *args:
+    uv run --no-sync pytest -x -q --no-header {{ args }}
 
 # Flake probe for the ordering-sensitive suites (session/operator-channel
 # state machines, where inter-test order leaks surface): run both suites
@@ -1044,10 +1035,15 @@ gen-stubs check="":
     # symbols), so the introspected build is never loaded or installed.
     cargo build --locked --manifest-path rust/Cargo.toml -p degenbot_rs --features experimental-inspect
     cargo build --locked --manifest-path rust/Cargo.toml -p degenbot-stubgen
+    case "$(uname -s)" in
+        Darwin) library="rust/target/debug/libdegenbot_rs.dylib" ;;
+        MINGW*|MSYS*|CYGWIN*) library="rust/target/debug/degenbot_rs.dll" ;;
+        *) library="rust/target/debug/libdegenbot_rs.so" ;;
+    esac
     out="$(mktemp -d)"
     trap 'rm -rf "$out"' EXIT
     rust/target/debug/degenbot-stubgen \
-        rust/target/debug/libdegenbot_rs.so _ffi "$out"
+        "$library" _ffi "$out"
     # Pipeline steps: ruff-format then ruff-check-fix the generated tree
     # BEFORE the diff/copy branch. The generator's raw signatures (long
     # single-line defs, `X |None`, unsorted imports) are not format- or

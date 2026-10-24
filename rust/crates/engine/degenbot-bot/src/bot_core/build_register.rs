@@ -22,8 +22,6 @@
 use std::sync::Arc;
 
 use alloy::primitives::{Address, I256, U256};
-use degenbot_db::snapshot::TickMapDb;
-use degenbot_pools::tick_fetch::TickWordFetcher;
 use degenbot_substrate::state_lock::LockSite;
 use degenbot_substrate::swap_simulation::{SwapOutcome, SwapRead, SwapRequest};
 
@@ -348,19 +346,15 @@ impl Bot {
     ///
     /// The construction io is a parameter (the shell fetched it via
     /// [`Self::require_construction_io`] — its error message carries the
-    /// pymethod prefix); the sparse-backfill fetcher, DB handle, and slot
-    /// layout ride [`route::V3RouteInputs`].
+    /// pymethod prefix); the slot layout rides [`route::V3RouteInputs`].
     ///
     /// # Errors
     /// [`V3BuildError::Refusal`] from the construction route,
     /// [`V3BuildError::NoReadableIdentity`] on the race-answer arm.
-    #[expect(clippy::too_many_arguments)]
     pub fn build_and_register_v3(
         &self,
         io: &ConstructionIo,
         plan: &route::ConstructionRoute,
-        db: Option<&dyn TickMapDb>,
-        fetcher: Option<Arc<dyn TickWordFetcher>>,
         slot_layout: Option<ClSlotLayout>,
         address: Address,
         block: Option<u64>,
@@ -371,11 +365,7 @@ impl Bot {
                 plan,
                 &route::RequestedPool::V3 { address },
                 io,
-                route::V3RouteInputs {
-                    db,
-                    fetcher,
-                    slot_layout,
-                },
+                route::V3RouteInputs { slot_layout },
                 block,
             ))
             .map_err(V3BuildError::Refusal)?;
@@ -433,7 +423,7 @@ impl Bot {
     }
 
     /// Build + register a V4 pool: the core `builder::build_v4` (LIVE
-    /// scalars off `state_view` + the Chain/Db tick-map arm) with the
+    /// canonical Erigon scalars and complete tick map) with the
     /// caller-supplied identity, then the `BotState` registration under ONE
     /// core write guard. Returns `(pool_id, coverage, protocol_fee,
     /// lp_fee)`; the identity echo is derived from the caller-supplied
@@ -445,9 +435,7 @@ impl Bot {
     pub fn build_and_register_v4(
         &self,
         identity: builder::V4PoolBuildIdentity,
-        db: Option<&dyn TickMapDb>,
         block: Option<u64>,
-        fetcher: Option<Arc<dyn TickWordFetcher>>,
     ) -> Result<(u64, String, u32, u32), V4BuildError> {
         let io = self.construction_io_required().map_err(|e| match e {
             BuildError::NoConstructionIo => V4BuildError::NoConstructionIo,
@@ -459,17 +447,12 @@ impl Bot {
         let span_fee = identity.fee;
         let span_tick_spacing = identity.tick_spacing;
         let result = degenbot_core::runtime::get_runtime()
-            .block_on(builder::build_v4(identity, db, &io, block))
+            .block_on(builder::build_v4(identity, &io, block))
             .map_err(V4BuildError::Builder)?;
-        let mut params = result.params;
-        // lp_fee + protocol_fee come from the SAME head-stamped slot0 read
-        // inside build_v4 (no second fetch_v4_slot0_liquidity each pool).
+        let params = result.params;
+        // Both fees belong to the builder's scalar snapshot.
         let lp_fee = result.lp_fee;
         let protocol_fee = params.protocol_fee;
-        // Sparse-map parity (the V4 twin of the V3 build): the builder leaves
-        // the backfill fetcher `None`; the driver's Python-wrapped fetcher
-        // rides in here.
-        params.fetcher = fetcher;
         let coverage = match params.coverage {
             PoolTickCoverage::Tracked => "tracked",
             PoolTickCoverage::Sparse => "sparse",
@@ -747,8 +730,6 @@ mod tests {
                     tick_spacing: 60,
                     hook_address: Address::ZERO,
                 },
-                None,
-                None,
                 None,
             ),
             Err(V4BuildError::NoConstructionIo)

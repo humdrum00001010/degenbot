@@ -85,12 +85,9 @@ pub struct ClOrchestration {
     /// by [`BotState::register_v4_pool`] refusals and consulted pre-RPC by the
     /// `PyO3` build path. Bounded by refused pools, not candidates.
     pub(crate) registration_gate: crate::registration_gate::RegistrationGate,
-    /// The snapshot seed block `S = min(fetch_newest_update_block(V3), V4)`.
-    /// Set by `Bot::load_snapshot_from_db` (or `load_snapshot_from_py`) when a
-    /// snapshot is loaded; consumed by the auto-backfill that
-    /// closes the `S+1..W-1` gap before resume. `None` when no snapshot was
-    /// loaded (cold-start path - the pump anchors on `first_observed_block`).
+    /// Optional manual replay boundary; it may only widen the registered snapshot gap.
     pub(crate) snapshot_seed_block: Option<u64>,
+    registered_snapshot_seed_block: Option<u64>,
     /// The highest FULLY-DELIVERED block - the delivery cutoff (last complete
     /// block). The registration drain reads this as the
     /// `drain_pump_completed` cutoff instead of a buffer-local shadow marker;
@@ -124,6 +121,7 @@ impl ClOrchestration {
             v4_state_views: HashMap::new(),
             registration_gate: crate::registration_gate::RegistrationGate::default(),
             snapshot_seed_block: None,
+            registered_snapshot_seed_block: None,
             pump_complete_cutoff: 0,
             v3_event_horizons: HashMap::new(),
             v4_event_horizons: HashMap::new(),
@@ -198,8 +196,7 @@ impl ClOrchestration {
     /// Returns [`RegisterV3PoolError::SpecViolation`] when `sqrt_price_x96`,
     /// `tick`, `fee`, or `tick_spacing` violates its Solidity-bounded on-chain
     /// invariant (see [`spec_bounds`]). These checks fire *before* the
-    /// registration-time tick-data seeding (the Db arm of `assemble_*_tick_map`
-    /// supplies `tick_data`/`coverage` via the held snapshot tx) + never touch
+    /// registration-time complete snapshot seeding and never touch
     /// the immutable config / current state scalars under validation here.
     pub(crate) fn register_v3_pool(
         &mut self,
@@ -240,11 +237,9 @@ impl ClOrchestration {
         reg.next_pool_id += 1;
         let address = params.address;
 
-        // the `seed_from_store` path is retired — the DB
-        // seeding is handled by the Db arm of `assemble_v3_tick_map` (held
-        // snapshot tx). Just clone + flow the params through.
         let params = params.clone();
         let (identity, state) = V3PoolState::from_params(params, reg.journal_depth);
+        self.record_snapshot_seed(state.initial_tick_data_block);
         reg.pools
             .insert(pool_id, PoolEntry::V3(Box::new((identity, state))));
         reg.pool_addresses.insert(address, pool_id);
@@ -280,6 +275,10 @@ impl ClOrchestration {
         else {
             return;
         };
+
+        if block_number <= state.initial_state_block {
+            return;
+        }
 
         // A Swap rewrites the slot0 head AND crosses ticks: it advances BOTH
         // clocks, so record both pre-event clock values for reorg restore, then
@@ -929,20 +928,19 @@ impl ClOrchestration {
             })
             .collect()
     }
-    /// Snapshot seed block `S` setter — the single source of truth for `S`.
-    ///
-    /// Production paths set `S` here in three ways:
-    /// - DB path: `Bot::load_snapshot_from_db` sets `S = min(newest_update_block_v3, v4)`.
-    /// - Non-DB path: the `PyArbitrageEngine::set_snapshot_seed_block` setter
-    ///   (called by `engine_registry.start()` after `load_*_from_py`) records
-    ///   `S = min(newest_block)` from the file/memory snapshot.
-    /// - Tests: inject `S` directly to drive the `S≥W` / `S=0` no-op branches
-    ///   of `BlockPump::backfill_from_snapshot` without a DB.
-    ///
-    /// `None` clears the seed (cold-start resume — `BlockPump::resume_from_subscribe`
-    /// skips the auto-backfill).
+    /// Set an explicit replay boundary for manually supplied state.
+    /// Registered complete snapshots always retain their earlier boundary.
     pub fn set_snapshot_seed_block(&mut self, s: Option<u64>) {
         self.snapshot_seed_block = s;
+    }
+
+    fn record_snapshot_seed(&mut self, block: Option<u64>) {
+        if let Some(block) = block {
+            self.registered_snapshot_seed_block = Some(
+                self.registered_snapshot_seed_block
+                    .map_or(block, |prior| prior.min(block)),
+            );
+        }
     }
     /// Read the pinned snapshot seed for a V3 pool. Returns the
     /// seed if the pool is `Tracked` and the seed has not yet been taken; `None`
@@ -969,10 +967,11 @@ impl ClOrchestration {
         &mut self,
         reg: &mut RegistryCore,
         address: Address,
-    ) -> Option<HashMap<i32, TickInfo>> {
+    ) -> Option<(HashMap<i32, TickInfo>, u64)> {
         let &pool_id = reg.pool_addresses.get(&address)?;
         let (_identity, state) = reg.pools.get_mut(&pool_id).and_then(PoolEntry::v3_mut)?;
-        state.snapshot_seed.take()
+        let block = state.initial_tick_data_block?;
+        state.snapshot_seed.take().map(|seed| (seed, block))
     }
     /// Pin the **post-drain** `(tick_data, block)` pair for a V3 pool (the step-2
     /// rolling-start race fix). Captures a frozen copy of the current
@@ -1017,21 +1016,15 @@ impl ClOrchestration {
                 // step-2 verify compares `tick_data` against on-chain@the
                 // pinned block, so the pinned block must be the liquidity clock.
                 //
-                // Fabricated-mismatch clamp: the verify block is the
-                // block the tick map is CONFIRMED-complete at. If the pump has
-                // any UNDRAINED event at/below the pool's liquidity clock
-                // (`pump_count_at_or_below > 0` — an in-progress block the
-                // drain held back at the cutoff), the map may be incomplete AT
-                // that clock block, and verifying there would compare an
-                // incomplete map against the full on-chain block -> false
-                // mismatch. Clamp down to the tombstone-complete cutoff. The
-                // `pump_count == 0` case is the BENIGN seed carrying the live
-                // WS head past the cutoff (mod.rs:580) — keep the clock block.
+                // Events already covered by the complete seed cannot make
+                // that snapshot partial, even before the pump's tombstone.
+                let seed = state.initial_tick_data_block.unwrap_or(0);
                 let undrained = self
                     .v3_buffer
-                    .pump_count_at_or_below(&address, liquidity_clock);
+                    .pump_count_at_or_below(&address, liquidity_clock)
+                    .saturating_sub(self.v3_buffer.pump_count_at_or_below(&address, seed));
                 let pinned_block = if undrained > 0 && cutoff > 0 {
-                    liquidity_clock.min(cutoff)
+                    liquidity_clock.min(cutoff).max(seed)
                 } else {
                     liquidity_clock
                 };
@@ -1140,6 +1133,9 @@ impl ClOrchestration {
         // the only permitted rewind here.
         state.update_block = update_block;
         state.tick_data_block = update_block;
+        state.initial_state_block = update_block;
+        state.initial_tick_data_block =
+            (state.coverage == PoolTickCoverage::Tracked).then_some(update_block);
         state.invalidate_tick_range_cache();
     }
     /// per-pool tick-mutation fingerprint for the staged word-fetch
@@ -1426,11 +1422,9 @@ impl ClOrchestration {
         let pool_id = reg.next_pool_id;
         reg.next_pool_id += 1;
 
-        // the `seed_from_store` path is retired — the DB
-        // seeding is handled by the Db arm of `assemble_v4_tick_map` (held
-        // snapshot tx). Just clone + flow the params through.
         let params = params.clone();
         let (identity, state) = V4PoolState::from_params(params, reg.journal_depth);
+        self.record_snapshot_seed(state.initial_tick_data_block);
         reg.pools
             .insert(pool_id, PoolEntry::V4(Box::new((identity, state))));
         self.v4_pool_ids.insert(key, pool_id);
@@ -2165,10 +2159,11 @@ impl ClOrchestration {
         reg: &mut RegistryCore,
         pool_manager: Address,
         pool_id: &degenbot_decoders::v4_swap_decoder::V4PoolId,
-    ) -> Option<HashMap<i32, TickInfo>> {
+    ) -> Option<(HashMap<i32, TickInfo>, u64)> {
         let pid = self.v4_pool_id_by_key(pool_manager, pool_id)?;
         let (_identity, state) = reg.pools.get_mut(&pid).and_then(PoolEntry::v4_mut)?;
-        state.snapshot_seed.take()
+        let block = state.initial_tick_data_block?;
+        state.snapshot_seed.take().map(|seed| (seed, block))
     }
     /// Pin the post-drain `(tick_data, block)` pair for a V4 pool (step-2 race
     /// fix, V4 twin of `pin_v3_post_drain_snapshot`). Captures a frozen copy
@@ -2211,15 +2206,13 @@ impl ClOrchestration {
                 // Two-stamp rule (V4 twin): pin pairs tick_data with the
                 // LIQUIDITY clock, not the price clock.
                 let liquidity_clock = state.tick_data_block;
-                // Fabricated-mismatch clamp (V4 twin): verify only at
-                // the block the map is confirmed-complete at. `> 0` undrained
-                // pump events at/below the clock + a nonzero cutoff -> clamp
-                // down to the cutoff; the `pump_count == 0` benign-seed case
-                // (mod.rs:580) and the no-tombstone (`cutoff == 0`) guard keep
-                // the clock block.
-                let undrained = self.v4_buffer.pump_count_at_or_below(&key, liquidity_clock);
+                let seed = state.initial_tick_data_block.unwrap_or(0);
+                let undrained = self
+                    .v4_buffer
+                    .pump_count_at_or_below(&key, liquidity_clock)
+                    .saturating_sub(self.v4_buffer.pump_count_at_or_below(&key, seed));
                 let pinned_block = if undrained > 0 && cutoff > 0 {
-                    liquidity_clock.min(cutoff)
+                    liquidity_clock.min(cutoff).max(seed)
                 } else {
                     liquidity_clock
                 };
@@ -2331,6 +2324,9 @@ impl ClOrchestration {
         // replaces both clocks with the same source block (sanctioned reset).
         state.update_block = update.update_block;
         state.tick_data_block = update.update_block;
+        state.initial_state_block = update.update_block;
+        state.initial_tick_data_block =
+            (state.coverage == PoolTickCoverage::Tracked).then_some(update.update_block);
         state.invalidate_tick_range_cache();
     }
     // ------------------------------------------------------------------
@@ -2403,14 +2399,22 @@ impl ClOrchestration {
         self.v3_buffer.set_max_age(max_age);
     }
 
-    /// The snapshot seed block `S` - `min(fetch_newest_update_block(V3), V4)`
-    /// across the loaded snapshots. `None` when no snapshot was loaded (the
-    /// cold-start path pumps directly from `first_observed_block`). Set by
-    /// `Bot::load_snapshot_from_db` / `load_snapshot_from_py`; consumed by the
-    /// auto-backfill (`resume_from_subscribe`) that closes `S+1..W-1`.
+    /// Earliest registered complete snapshot, widened by any explicit manual
+    /// replay boundary. Startup replay closes the inclusive gap through the WS anchor.
     #[must_use]
     pub const fn snapshot_seed_block(&self) -> Option<u64> {
-        self.snapshot_seed_block
+        match (
+            self.registered_snapshot_seed_block,
+            self.snapshot_seed_block,
+        ) {
+            (Some(registered), Some(manual)) => Some(if registered < manual {
+                registered
+            } else {
+                manual
+            }),
+            (Some(registered), None) => Some(registered),
+            (None, manual) => manual,
+        }
     }
 }
 
@@ -2643,7 +2647,10 @@ impl BotState {
     }
 
     /// Delegates to the CL orchestration capability - see [`ClOrchestration::take_v3_snapshot_seed`].
-    pub fn take_v3_snapshot_seed(&mut self, address: Address) -> Option<HashMap<i32, TickInfo>> {
+    pub fn take_v3_snapshot_seed(
+        &mut self,
+        address: Address,
+    ) -> Option<(HashMap<i32, TickInfo>, u64)> {
         self.cl.take_v3_snapshot_seed(&mut self.registry, address)
     }
 
@@ -2980,7 +2987,7 @@ impl BotState {
         &mut self,
         pool_manager: Address,
         pool_id: &degenbot_decoders::v4_swap_decoder::V4PoolId,
-    ) -> Option<HashMap<i32, TickInfo>> {
+    ) -> Option<(HashMap<i32, TickInfo>, u64)> {
         self.cl
             .take_v4_snapshot_seed(&mut self.registry, pool_manager, pool_id)
     }

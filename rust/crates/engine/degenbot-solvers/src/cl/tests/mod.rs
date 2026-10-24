@@ -1627,6 +1627,7 @@ fn pool_at_tick0(
         update_block: 0,
         tick_data_block: 0,
         initial_state_block: 0,
+        initial_tick_data_block: Some(0),
         state_nonce: 0,
         registration_lifecycle: degenbot_pools::v3_state::RegistrationLifecycle::default(),
         tick_data,

@@ -667,8 +667,6 @@ crate::config_schema! {
             doc = "RPC URL for the offline CL capture/boundary-scan examples (network-gated).";
         clcap_block [opt u64] = None, env = "DEGENBOT_CLCAP_BLOCK", def = "(unset)",
             doc = "Pinned block for the CL capture generator.";
-        clcap_max_fetches [usize] = 320, env = "DEGENBOT_CLCAP_MAX_FETCHES", def = "320",
-            doc = "Max active-set fetches backfilled by the CL capture generator.";
         clcap_path_cap [usize] = 12, env = "DEGENBOT_CLCAP_PATH_CAP", def = "12",
             doc = "Per-block path cap for the CL capture generator.";
         scan_block [opt u64] = None, env = "DEGENBOT_SCAN_BLOCK", def = "(unset)",

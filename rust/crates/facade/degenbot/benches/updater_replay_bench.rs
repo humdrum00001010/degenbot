@@ -70,8 +70,6 @@ const MEASURED_RUNS: usize = 9;
 //    suites gate on) ─────────────────────────────────────────────────────────
 
 const POOL_UPDATE_CASSETTE: &str = "pool_update_chunk_26102622-26102626.json";
-const POOL_VERIFY_CASSETTE: &str = "pool_verify_chunk_26102622-26102626.json";
-const POOL_DENSE_CASSETTE: &str = "pool_dense_update_26131653-26133246.json";
 const AAVE_UPDATE_CASSETTE: &str = "aave_update_chunk_26130440-26130445.json";
 /// The config-era capture (the pre-lock fact-phase corpus): the GHO-discount
 /// era span 19,091,050..=19,091,059 — THREE variable-debt GHO `Burn`s by the
@@ -81,26 +79,6 @@ const AAVE_UPDATE_CASSETTE: &str = "aave_update_chunk_26130440-26130445.json";
 /// same-user txs take the DB-cache path against the row the ops parser
 /// created in the first tx. The recorded cross-tx fact-dependence shape.
 const AAVE_CONFIG_CASSETTE: &str = "aave_config_chunk_19091050-19091059.json";
-
-/// The dense-pool capture (Perf B's measurement corpus): the USDC/WETH 0.05%
-/// V3 pool `0x88e6A0c2…` over blocks 26131653..=26133246 — 27 `Mint`/`Burn`
-/// events on that pool touching 26 distinct ticks, the whole-chain scan
-/// carrying 485 logs from 116 emitters. The pool is DEEP: the harness seeds
-/// its base map (2048 in-range positions + the full-range mint's two extreme
-/// ticks — a deterministic synthetic at the pool's real-order depth; the
-/// values are harness inputs exactly like the Aave substrate seed, and the
-/// dense posture runs gate-OFF so nothing verifies them against chain). The
-/// SQL shape the Perf B delta targets is the map DEPTH, not the values.
-const DENSE_POOL_ADDRESS: &str = "0x88e6A0c2dDD26FEEb64F039a2c41296FcB3f5640";
-const DENSE_TOKEN0: &str = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"; // USDC
-const DENSE_TOKEN1: &str = "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"; // WETH
-/// The synthetic base map: 2048 in-range positions, tick `189310 + 10*k` —
-/// multiples of the pool's spacing 10 covering every non-extreme event tick.
-const DENSE_SEEDED_TICKS: usize = 2048;
-const DENSE_FIRST_SEEDED_TICK: i64 = 189_310;
-/// The full-range mint's extreme ticks (the recorded span carries a
-/// `-887270..887270` mint) — seeded so their words exist in the base.
-const DENSE_EXTREME_TICKS: [i64; 2] = [-887_270, 887_270];
 
 fn corpus_path(file: &str) -> String {
     format!(
@@ -125,21 +103,6 @@ const V3_FACTORY: &str = "0x1F98431c8aD98523631AE4a59f267346ea31F984";
 /// the bench re-asserts them so a corpus/loop drift cannot masquerade as a
 /// timing change).
 const EXPECTED_POOL_POOLS: usize = 1;
-/// The dense span's `PoolCreated` events for the canonical V3 factory
-/// (recorded pass; the replay commits exactly these pool rows).
-const EXPECTED_DENSE_POOLS: usize = 6;
-/// The dense span's in-scope liquidity applies: the seeded USDC/WETH row
-/// PLUS the six pools the chunk's own `PoolCreated` upserts create (new pools
-/// mint immediately — each takes the fused in-transaction path). The other
-/// ~110 emitters are unknown → scope-skipped without a fetch.
-const EXPECTED_DENSE_LIQUIDITY_APPLIES: usize = 7;
-/// Distinct ticks the dense span's 27 USDC/WETH events touch (2 slots × 27
-/// events, deduped — derived from the committed cassette's logs; the
-/// per-touched-tick metric's denominator).
-const EXPECTED_DENSE_TOUCHED_TICKS: usize = 26;
-/// The seed corpus's single Mint touches the created pool's two boundary
-/// ticks (the ledger's positions upsert writes 2 rows).
-const EXPECTED_SEED_TOUCHED_TICKS: usize = 2;
 const EXPECTED_AAVE_EVENTS: usize = 20;
 /// The config-era span's applied-event count (the replay suite's measured
 /// literal — GHO debt burns + position/user creation + the USDT/WETH ops).
@@ -148,7 +111,7 @@ const EXPECTED_AAVE_CONFIG_EVENTS: usize = 32;
 // ── the workloads (what the bench measures, in table order) ────────────────
 
 /// One pool workload's fixed configuration: which seed builds the harness
-/// database, whether the verify gate runs, and the corpus outcome literals
+/// database and the catalog outcome literals
 /// each iteration re-asserts. The iteration loop varies nothing else; the
 /// spec pins the measurement's shape.
 struct PoolWorkload {
@@ -156,53 +119,22 @@ struct PoolWorkload {
     label: &'static str,
     /// The committed cassette the transport replays.
     cassette_file: &'static str,
-    /// Whether the chunk's pre-commit verify gate runs.
-    verify_chunk: bool,
-    /// The harness database seeder (`seed_pool_db` or the dense deep-map
-    /// variant).
+    /// The catalog database seeder.
     seed_db: fn(&Path, i64, u64) -> std::path::PathBuf,
     /// Expected `total_pools_written` for the recorded span.
     expected_pools: usize,
-    /// Expected in-scope liquidity applies (0 = the workload does not gate
-    /// on applies).
-    expected_applies: usize,
     /// Event-touched ticks on the capture's in-scope pool (the per-tick
     /// columns' denominator).
     touched_ticks: usize,
 }
 
-/// The seed-corpus pool update (verify gate OFF).
+/// The catalog discovery workload.
 const POOL_UPDATE_WORKLOAD: PoolWorkload = PoolWorkload {
-    label: "pool_update_chunk_26102622-26102626 (verify gate OFF)",
+    label: "pool_catalog_chunk_26102622-26102626",
     cassette_file: POOL_UPDATE_CASSETTE,
-    verify_chunk: false,
     seed_db: seed_pool_db,
     expected_pools: EXPECTED_POOL_POOLS,
-    expected_applies: 0,
-    touched_ticks: EXPECTED_SEED_TOUCHED_TICKS,
-};
-
-/// The seed-corpus pool verify pass (verify gate ON).
-const POOL_VERIFY_WORKLOAD: PoolWorkload = PoolWorkload {
-    label: "pool_verify_chunk_26102622-26102626 (verify gate ON)",
-    cassette_file: POOL_VERIFY_CASSETTE,
-    verify_chunk: true,
-    seed_db: seed_pool_db,
-    expected_pools: EXPECTED_POOL_POOLS,
-    expected_applies: 0,
-    touched_ticks: EXPECTED_SEED_TOUCHED_TICKS,
-};
-
-/// The dense-capture pool update (verify gate OFF, the deep synthetic map:
-/// Perf B's measurement corpus).
-const POOL_DENSE_WORKLOAD: PoolWorkload = PoolWorkload {
-    label: "pool_dense_update_26131653-26133246 (gate OFF, deep map)",
-    cassette_file: POOL_DENSE_CASSETTE,
-    verify_chunk: false,
-    seed_db: seed_dense_pool_db,
-    expected_pools: EXPECTED_DENSE_POOLS,
-    expected_applies: EXPECTED_DENSE_LIQUIDITY_APPLIES,
-    touched_ticks: EXPECTED_DENSE_TOUCHED_TICKS,
+    touched_ticks: 0,
 };
 
 /// A temp DB with one ACTIVE `uniswap_v3` exchange stamped at `from - 1`
@@ -223,115 +155,6 @@ fn seed_pool_db(dir: &Path, chain_id: i64, from: u64) -> std::path::PathBuf {
     path
 }
 
-/// The DENSE pool harness DB: the seed rows above PLUS the USDC/WETH 0.05%
-/// pool row and its deep synthetic base map (2048 in-range positions across
-/// their bitmap words + the two full-range extreme ticks). Seeding rides a
-/// plain handle BEFORE the ledger arms, so the run's statement ledger holds
-/// only the chunk loop's SQL (the seed is harness input, not workload).
-///
-/// The seeded values are deterministic and burn-safe: gross is `2^100` (any
-/// recorded burn keeps `gross + delta >= 0`), net alternates sign so both
-/// tick orientations exist. The bitmap words are computed with the canonical
-/// EVM formula (`compressed = tick / spacing; word = compressed >> 8; bit =
-/// compressed.rem_euclid(256)` — `degenbot-math`'s
-/// `get_tick_word_and_bit_position`), so the apply's bit flips land on real
-/// base words rather than seeding fresh ones.
-fn seed_dense_pool_db(dir: &Path, chain_id: i64, from: u64) -> std::path::PathBuf {
-    use alloy::primitives::U256;
-    use degenbot::math::cl::liquidity_mapping::get_tick_word_and_bit_position;
-
-    let path = dir.join("bench-dense.db");
-    let (db, _state) = DegenbotDb::open_for_writes(&path).unwrap();
-    let factory: Address = V3_FACTORY.parse().unwrap();
-    let exchange = db
-        .upsert_exchange(chain_id, "uniswap_v3", factory, None)
-        .unwrap();
-    let pool_address: Address = DENSE_POOL_ADDRESS.parse().unwrap();
-    let token0: Address = DENSE_TOKEN0.parse().unwrap();
-    let token1: Address = DENSE_TOKEN1.parse().unwrap();
-    db.upsert_v3_pools(
-        chain_id,
-        "uniswap_v3",
-        exchange.id,
-        1_000_000,
-        &[degenbot::db::V3PoolRowInput {
-            address: pool_address,
-            token0_address: token0,
-            token1_address: token1,
-            fee: 500,
-            tick_spacing: 10,
-        }],
-    )
-    .unwrap();
-    let pool_id: i64 = {
-        let conn = db.lock();
-        conn.query_row(
-            "SELECT id FROM pools WHERE address = ?1 AND chain = ?2",
-            rusqlite::params![pool_address.to_checksum(None), chain_id],
-            |r| r.get(0),
-        )
-        .unwrap()
-    };
-
-    let mut ticks: Vec<i64> = (0..i64::try_from(DENSE_SEEDED_TICKS).unwrap())
-        .map(|k| DENSE_FIRST_SEEDED_TICK + 10 * k)
-        .collect();
-    ticks.extend_from_slice(&DENSE_EXTREME_TICKS);
-    ticks.sort_unstable();
-    ticks.dedup();
-
-    // The deterministic base values (burn-safe gross, alternating net sign).
-    // Each seeded tick sets its bit in the accumulated word bitmap — the same
-    // flip the apply's `flip_tick` would produce — so the base words are real.
-    let gross: U256 = U256::from(1u8) << 100;
-    let mut word_bits: std::collections::BTreeMap<i32, U256> = std::collections::BTreeMap::new();
-    let conn = rusqlite::Connection::open(&path).unwrap();
-    conn.execute("BEGIN", []).unwrap();
-    {
-        let mut stmt = conn
-            .prepare(
-                "INSERT INTO liquidity_positions (pool_id, tick, liquidity_net, liquidity_gross) \
-                 VALUES (?1, ?2, ?3, ?4)",
-            )
-            .unwrap();
-        for (k, &tick) in ticks.iter().enumerate() {
-            let net: i128 = if k % 2 == 0 {
-                1i128 << 100
-            } else {
-                -(1i128 << 100)
-            };
-            stmt.execute(rusqlite::params![
-                pool_id,
-                i32::try_from(tick).unwrap(),
-                net.to_string(),
-                gross.to_string()
-            ])
-            .unwrap();
-            let (word, bit) = get_tick_word_and_bit_position(i32::try_from(tick).unwrap(), 10);
-            let bit_mask = U256::from(1u8) << u64::from(bit);
-            *word_bits.entry(word).or_insert(U256::ZERO) |= bit_mask;
-        }
-    }
-    {
-        let mut stmt = conn
-            .prepare("INSERT INTO initialization_maps (pool_id, word, bitmap) VALUES (?1, ?2, ?3)")
-            .unwrap();
-        for (word, bitmap) in &word_bits {
-            stmt.execute(rusqlite::params![pool_id, *word, bitmap.to_string()])
-                .unwrap();
-        }
-    }
-    conn.execute("COMMIT", []).unwrap();
-    conn.execute(
-        "UPDATE exchanges SET active = 1, last_update_block = ?1 WHERE id = ?2",
-        rusqlite::params![i64::try_from(from - 1).unwrap(), exchange.id],
-    )
-    .unwrap();
-    path
-}
-
-/// The Aave V3 Ethereum bootstrap block (`activate_aave_market`'s fresh-seed
-/// stamp; mirrors `aave_cassette_replay.rs`).
 const AAVE_BOOTSTRAP_BLOCK: i64 = 16_291_070;
 
 const POOL_ADDRESS_PROVIDER: &str = "0x2f39d218133AFaB8F2B819B1066c7E434Ad94E9e";
@@ -669,8 +492,6 @@ fn pool_stage_sums(chunks: &[ChunkProgress], total: Duration, sql_us: u64) -> St
     };
     for c in chunks {
         t.fetch += c.fetch_time;
-        t.decode_compute += c.decode_compute_time;
-        t.verify += c.verify_time;
         t.apply += c.apply_time;
         t.write_lock_hold += c.write_lock_hold_time;
     }
@@ -725,9 +546,6 @@ fn pool_iteration(
             provider,
             Arc::new(AtomicBool::new(false)),
             collector.clone(),
-            workload.verify_chunk,
-            None,
-            false,
         )
         .unwrap_or_else(|e| panic!("the replayed pool run must commit cleanly: {e}"));
         let records = ledger.records().expect("the capture session is armed");
@@ -752,12 +570,6 @@ fn pool_iteration(
         report.total_pools_written, workload.expected_pools,
         "the corpus outcome drifted — this is a fixture problem, not a timing one"
     );
-    if workload.expected_applies > 0 {
-        assert_eq!(
-            report.total_liquidity_applies, workload.expected_applies,
-            "the corpus outcome drifted — this is a fixture problem, not a timing one"
-        );
-    }
     let served = transport.served_snapshot();
     assert_eq!(
         served.requests, served.served,
@@ -1011,8 +823,6 @@ fn main() {
 
     let measurements = vec![
         measure_pool(&POOL_UPDATE_WORKLOAD),
-        measure_pool(&POOL_VERIFY_WORKLOAD),
-        measure_pool(&POOL_DENSE_WORKLOAD),
         measure_aave(
             "aave_update_chunk_26130440-26130445",
             AAVE_UPDATE_CASSETTE,
@@ -1090,13 +900,11 @@ fn print_table(measurements: &[Measurement]) {
 /// timing caveat, the per-tick columns' meaning, and the reproduce command.
 fn print_legend() {
     println!(
-        "stages: fetch = RPC log fetches; dc+cmp = in-transaction decode+compute (pool: map read+compute; aave: per-tx discount pre-pass + config-dispatch reads — both under the write lock); verify = pre-commit on-chain gate (0 when off); apply = remaining in-transaction SQL; lock-hold = transaction() open → commit/drop."
+        "stages: fetch = RPC log fetches; dc+cmp = Aave in-transaction decode+compute (zero for pool catalog discovery); verify = pre-commit on-chain gate (0 when off); apply = remaining in-transaction SQL; lock-hold = transaction() open → commit/drop."
     );
     println!(
         "sql µs = the statement ledger's summed profile times — SQLite's legacy CurrentTimeInt64 profile path quantizes each statement to whole milliseconds, so treat sql µs as a coarse floor (the Instant stage spans carry the fine timing)."
     );
-    println!(
-        "stmts/tick + args/tick = the ledger's statement count and total bind parameters per event-touched tick on the capture's in-scope pool (the O(map) vs O(dirty) shape; the dense capture's deep map makes the per-statement SIZE visible: the full-map persist binds 4×live-tick params, the delta persist 4×dirty)."
-    );
+    println!("per-tick columns are not applicable to catalog discovery or Aave workloads.");
     println!("one command reproduces: just bench-updaters");
 }

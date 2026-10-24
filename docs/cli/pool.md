@@ -13,6 +13,7 @@ tags:
   - liquidity
 related_files:
   - ../rust-cli.md
+  - ../architecture/erigon-tick-maps.md
   - ../../src/degenbot/db/__init__.py
   - ../../rust/crates/foundation/degenbot-db/src/schema.rs
   - ../../src/degenbot/uniswap/v3_liquidity_pool.py
@@ -22,7 +23,7 @@ complexity: complex
 
 ## Overview
 
-The Pool CLI provides commands for managing liquidity pool metadata and tracking liquidity positions across multiple DEX versions (Uniswap 2, 3, and 4) on Base and Ethereum mainnet. The main command `pool update` fetches blockchain events for pool discovery and liquidity updates, synchronizing database with current pool states.
+The Pool CLI manages the pool catalog across supported DEX versions. `pool update` discovers pools from factory events and records their identities and metadata; it does not reconstruct current liquidity positions or tick maps. Bot initialization obtains complete concentrated-liquidity state from Erigon's block-pinned `erigon_getTickMaps` method; see the [tick-map architecture](../architecture/erigon-tick-maps.md).
 
 ## Background: Pool Architecture
 
@@ -53,14 +54,14 @@ V4 uses separate `ManagedPool` database tables with PoolManager contract referen
 
 ## Commands
 
-The command vocabulary is **Rust-owned**: [`degenbot-cli`](../../rust/crates/shells/degenbot-cli/src/argv.rs) declares it over `degenbot-cli-core`'s [pool](../../rust/crates/shells/degenbot-cli-core/src/pool.rs) and [exchange](../../rust/crates/shells/degenbot-cli-core/src/exchange.rs) arms. The authoritative flag/exit-code reference is the [Rust CLI page](../rust-cli.md); the domain behaviour below is unchanged.
+The command vocabulary is **Rust-owned**: [`degenbot-cli`](../../rust/crates/shells/degenbot-cli/src/argv.rs) declares it over `degenbot-cli-core`'s [pool](../../rust/crates/shells/degenbot-cli-core/src/pool.rs) and [exchange](../../rust/crates/shells/degenbot-cli-core/src/exchange.rs) arms. The authoritative flag/exit-code reference is the [Rust CLI page](../rust-cli.md); the catalog behavior is summarized below.
 
 ### `degenbot pool update`
 
-Update pool metadata and liquidity positions for all activated exchanges.
+Discover pools and update catalog metadata for all activated exchanges.
 
 ```bash
-degenbot pool update [--chunk SIZE] [--to-block BLOCK] [--verify-chunk|--no-verify-chunk] [--verify-all|--no-verify-all] [--verify-all-interval BLOCKS]
+degenbot pool update [--chunk SIZE] [--to-block BLOCK]
 ```
 
 #### Parameters
@@ -82,11 +83,11 @@ Examples:
 
 #### Behavior
 
-1. **Identify active chains**: Queries database for chains with active exchanges
-2. **Determine update range**: Starts from `min(last_update_block + 1)` across exchanges
-3. **Process in chunks**: Iteratively processes blocks up to `chunk_size`
-4. **Track progress**: Displays progress bar showing blocks processed
-5. **Skip up-to-date chains**: If no new blocks exist since last update, skips
+1. **Identify active exchanges**: Reads the enabled catalog-discovery specs
+2. **Determine update range**: Starts from each exchange's discovery cursor
+3. **Discover pools**: Reads factory creation events and records pool identity and metadata
+4. **Commit progress**: Writes each chunk atomically and advances the catalog cursor
+5. **Skip up-to-date exchanges**: If no new blocks remain, skips discovery
 
 #### Example Usage
 

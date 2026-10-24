@@ -72,20 +72,8 @@ const DUMP_GOLDEN_PATH: &str = concat!(
     "/../../../../tests/fixtures/sql_goldens/pool_update_chunk_26102622-26102626.db-dump.json"
 );
 
-/// Independent literal: the exact number of statements one chunk apply runs
-/// over this corpus. Any N+1-style regression (a query hoisted out of a loop
-/// going back in, a per-row re-read) changes this and fails the plain test
-/// run — before the byte-diff even consults the committed golden.
-///
-/// Perf B (23 → 21): the delta persist removed the two full-map complement
-/// deletes (`DELETE … WHERE pool_id = ? AND tick NOT IN (?, ?)` and the
-/// `initialization_maps` twin) — a chunk-new pool's drained set is empty, so
-/// the delta path issues no delete at all (both removed statements carried
-/// `rows_changed: 0` on this corpus). The two map READS changed SHAPE, not
-/// count: the full-map SELECTs became the dirty-key IN-form
-/// (`… WHERE pool_id = ? AND tick IN (?, ?)` — the Perf B read surface).
-/// Classified in the task sign-off; the DB dump golden is byte-identical.
-const EXPECTED_LEDGER_STATEMENTS: usize = 21;
+/// Independent statement count for the catalog-only chunk.
+const EXPECTED_LEDGER_STATEMENTS: usize = 10;
 
 /// The tables one pool-chunk apply touches, in the dump's fixed (alphabetical)
 /// order. `exchanges` is the chunk's commit stamp; `erc20_tokens` the token
@@ -174,11 +162,6 @@ fn pool_chunk_ledger_and_db_dump_match_the_committed_goldens() {
         provider,
         Arc::new(AtomicBool::new(false)),
         Arc::new(NoProgress),
-        // The verification gate stays OFF (same posture as
-        // `cassette_replay_run.rs` — the corpus records the fetch surface).
-        false,
-        None,
-        false,
     )
     .expect("the replayed run must commit cleanly");
     assert_eq!(report.chunks_committed, 1, "one chunk apply");

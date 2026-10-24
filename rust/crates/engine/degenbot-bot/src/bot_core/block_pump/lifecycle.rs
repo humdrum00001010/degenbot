@@ -1,7 +1,7 @@
 use super::{
-    op_error, op_info, op_warn, stance, stream, Arc, AtomicBool, BlockPump, Bot, Duration,
-    PumpControl, QuiesceParams, StageHandlers, StreamExt, SubscribeState, Watchdog, WsEvent,
-    WsIngestor, DEFAULT_BACKFILL_CHUNK_SIZE,
+    op_info, op_warn, stance, stream, Arc, AtomicBool, BlockPump, Bot, Duration, PumpControl,
+    QuiesceParams, StageHandlers, StreamExt, SubscribeState, Watchdog, WsEvent, WsIngestor,
+    DEFAULT_BACKFILL_CHUNK_SIZE,
 };
 
 impl BlockPump {
@@ -77,8 +77,8 @@ impl BlockPump {
     /// Resume the pump from a subscribe state — auto-backfilling the
     /// snapshot→WS gap before the live loop begins.
     ///
-    /// When the core `BotState` carries a snapshot seed `S` (set by
-    /// `Bot::load_snapshot_from_db` or `load_*_from_py`) strictly less than
+    /// When the core `BotState` carries a replay floor `S` derived from
+    /// complete pool snapshots or an explicit replay anchor strictly less than
     /// the first observed WS block `W`, this method first awaits
     /// [`backfill_from_snapshot`](Self::backfill_from_snapshot) with the
     /// pump's own provider — applying `S+1..W` (inclusive) log state under
@@ -94,20 +94,21 @@ impl BlockPump {
     ///
     /// Panics if `subscribe_state.combined_stream` is `None` (i.e., `subscribe()`
     /// was not called first).
-    pub async fn resume_from_subscribe(&mut self, subscribe_state: SubscribeState) {
+    /// # Errors
+    /// Returns the replay failure before starting live processing.
+    pub async fn resume_from_subscribe(
+        &mut self,
+        subscribe_state: SubscribeState,
+    ) -> Result<(), String> {
         #[expect(clippy::expect_used)] // invariant-guarded (documented)
         let combined = subscribe_state
             .combined_stream
             .expect("resume() called without WS stream — did you call subscribe() first?");
         let first_block = subscribe_state.first_block;
         let (backfill_res, combined) = self.backfill_with_drain(first_block, combined).await;
-        if let Err(e) = backfill_res {
-            op_error!(domain = pump, first_block,
-                %e,
-                "BlockPump: auto-backfill failed — starting live loop from gap (not closed)"
-            );
-        }
+        backfill_res?;
         self.run_with_stream(combined, first_block).await;
+        Ok(())
     }
 
     /// run the snapshot→WS gap backfill while concurrently
@@ -219,8 +220,8 @@ impl BlockPump {
     /// buffered when `build_paths` drained → `VerificationMismatchError` at
     /// post-drain verify (2026-07-12 settlement-arbitrage crash).
     ///
-    /// No-op when `S` is unset (cold start), `S >= W` (catch-up snapshot), or
-    /// `S == 0`. Errors log + return (the live loop still starts from `W`).
+    /// No-op when no CL state needs replay or the snapshot is already at W.
+    /// Registered CL state without a replay boundary refuses startup.
     ///
     /// # Errors
     ///
@@ -232,8 +233,12 @@ impl BlockPump {
             .state_arc()
             .read_at(degenbot_substrate::state_lock::LockSite::Pump)
             .snapshot_seed_block();
-        let Some(seed) = s else { return Ok(0) };
-        if seed == 0 || ws_block == 0 || seed >= ws_block {
+        let Some(seed) = s else {
+            return self
+                .backfill_from_snapshot(ws_block, DEFAULT_BACKFILL_CHUNK_SIZE)
+                .await;
+        };
+        if ws_block == 0 || seed >= ws_block {
             return Ok(0);
         }
         op_info!(

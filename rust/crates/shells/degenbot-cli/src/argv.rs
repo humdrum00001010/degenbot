@@ -229,20 +229,8 @@ pub enum PoolSub {
         /// after the last 'safe' block.
         #[arg(long = "to-block", value_name = "BLOCK", default_value = DEFAULT_TO_BLOCK)]
         to_block: String,
-        /// The pre-commit verification gates.
-        #[command(flatten)]
-        verify: VerifyFlags,
-        /// Block interval for the `--verify-all` full-verification gate. A chunk
-        /// that crosses or lands-on a multiple of this interval triggers a
-        /// pre-commit market-wide verify. Ignored unless `--verify-all` is set.
-        #[arg(
-            long = "verify-all-interval",
-            value_name = "BLOCKS",
-            default_value_t = DEFAULT_VERIFY_ALL_INTERVAL
-        )]
-        verify_all_interval: u64,
     },
-    /// Verify a pool's committed liquidity map against on-chain truth.
+    /// Verify a pool's complete Erigon snapshot against on-chain truth.
     Verify {
         /// The HTTP RPC endpoint to read on-chain truth from.
         #[arg(long = "rpc-url", value_name = "URL", required = true)]
@@ -794,14 +782,9 @@ fn pool(command: &PoolSub) -> PoolCommand {
         PoolSub::Update {
             chunk_size,
             to_block,
-            verify,
-            verify_all_interval,
         } => PoolCommand::Update {
             chunk_size: *chunk_size,
             to_block: to_block.clone(),
-            verify_chunk: verify.chunk_gate(),
-            verify_all: verify.all_gate(),
-            verify_all_interval: *verify_all_interval,
         },
         PoolSub::Verify {
             rpc_url,

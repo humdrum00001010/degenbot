@@ -511,15 +511,13 @@ pub enum PoolReport {
         chunks_committed: usize,
         /// Pool rows written.
         total_pools_written: usize,
-        /// Per-pool liquidity applies.
-        total_liquidity_applies: usize,
     },
     /// `pool update` was cooperatively cancelled; committed chunks stay durable.
     UpdateCancelled {
         /// The chain.
         chain_id: i64,
     },
-    /// `pool verify` compared the committed map against on-chain truth.
+    /// `pool verify` compared the Erigon map against ordinary contract getters.
     Verified {
         /// The pool identifier.
         pool: String,
@@ -543,11 +541,9 @@ impl PoolReport {
                 to_block,
                 chunks_committed,
                 total_pools_written,
-                total_liquidity_applies,
             } => vec![format!(
                 "Chain {chain_id}: advanced {from_block}->{to_block} in {chunks_committed} \
-                 chunks ({total_pools_written} pools written, {total_liquidity_applies} \
-                 liquidity applies)."
+                 chunks ({total_pools_written} pools written)."
             )],
             Self::UpdateCancelled { chain_id } => vec![format!(
                 "Chain {chain_id}: cancelled (committed chunks stay durable)."

@@ -111,7 +111,6 @@ impl std::error::Error for RegistrationLifecycleError {}
 pub async fn run_cl_v3_lifecycle<F1, Fut1, F2, Fut2, E>(
     core: &StateLock<BotState>,
     address: Address,
-    snapshot_block: Option<u64>,
     verify_seed: F1,
     verify_post_drain: F2,
 ) -> Result<(), E>
@@ -147,35 +146,29 @@ where
     core.write_at(degenbot_substrate::state_lock::LockSite::Registration)
         .set_v3_pool_quarantined(address);
 
-    // Step-1: verify the pinned snapshot SEED @ snapshot block. Only
-    // when a snapshot block is supplied (the seam's gated-skip posture); the
-    // seed is consumed exactly once so memory is bounded. The comparison is
-    // seed-vs-on-chain@snapshot, NOT engine-current (which would
-    // false-mismatch every active pool under a rolling start).
-    //
-    // Reactivated wrong-block regression: anchor at
-    // the pool's OWN liquidity clock (the block its seed data reflects — a
-    // DB-seeded `Tracked` pool's `liquidity_update_block`) rather than the
-    // aggregate snapshot-seed block `S`. The builder stamps a DB-seeded pool's
-    // `tick_data_block` at that block; using it here means a stale-but-
-    // internally-consistent DB pool is verified against on-chain @ ITS block
-    // (passes), not @ `S` (fabricated mismatch on any tick that moved in
-    // between). Falls back to `S` only when the pool clock is unset (0).
-    if let Some(snapshot_block) = snapshot_block {
-        let seed = {
-            core.write_at(degenbot_substrate::state_lock::LockSite::Registration)
-                .take_v3_snapshot_seed(address)
-        };
-        if let Some(seed) = seed {
-            // Single acquisition by construction: the fused accessor chains
-            // id → liquidity clock under ONE `read_at(Registration)`. Never
-            // recompose the two single-step reads here — nested reads are a
-            // self-deadlock when a writer queues between them
-            // (soak-2026-08-22).
-            let own = core.pool_tick_data_block_by_address(&address);
-            let seed_block = if own > 0 { own } else { snapshot_block };
-            verify_seed(seed, seed_block).await?;
+    // The seed and its immutable horizon must be captured together: live
+    // event application may already have advanced the pool's liquidity clock.
+    let seed = {
+        let guard = core.read_at(degenbot_substrate::state_lock::LockSite::Registration);
+        guard
+            .registered_pool_by_address(&address)
+            .and_then(|(id, _)| guard.get_v3_pool(id))
+            .and_then(|state| Some((state.snapshot_seed.clone()?, state.initial_tick_data_block?)))
+    };
+    if let Some((seed, block)) = seed {
+        verify_seed(seed.clone(), block).await?;
+        let mut guard = core.write_at(degenbot_substrate::state_lock::LockSite::Registration);
+        let unchanged = guard
+            .registered_pool_by_address(&address)
+            .and_then(|(id, _)| guard.get_v3_pool(id))
+            .is_some_and(|state| {
+                state.initial_tick_data_block == Some(block)
+                    && state.snapshot_seed.as_ref() == Some(&seed)
+            });
+        if !unchanged {
+            return Ok(());
         }
+        guard.take_v3_snapshot_seed(address);
     }
 
     // Drain + pin under a SINGLE `core.write()` hold: backfill buffer, then
@@ -223,7 +216,6 @@ pub async fn run_cl_v4_lifecycle<F1, Fut1, F2, Fut2, E>(
     core: &StateLock<BotState>,
     pool_manager: Address,
     pool_id: V4PoolId,
-    snapshot_block: Option<u64>,
     verify_seed: F1,
     verify_post_drain: F2,
 ) -> Result<(), E>
@@ -254,23 +246,27 @@ where
     core.write_at(degenbot_substrate::state_lock::LockSite::Registration)
         .set_v4_pool_quarantined(pool_manager, pool_id);
 
-    // Step-1: verify the pinned snapshot seed @ snapshot block.
-    // Anchored at the pool's OWN liquidity clock , falling back
-    // to the aggregate `S` only when the pool clock is unset — see the V3
-    // commentary above.
-    if let Some(snapshot_block) = snapshot_block {
-        let seed = {
-            core.write_at(degenbot_substrate::state_lock::LockSite::Registration)
-                .take_v4_snapshot_seed(pool_manager, &pool_id)
-        };
-        if let Some(seed) = seed {
-            // Same single-acquisition invariant as the V3 site: the fused
-            // accessor takes ONE `read_at(Registration)` for the
-            // `(pool_manager, pool_id)` → clock chain (soak-2026-08-22).
-            let own = core.pool_tick_data_block_by_v4_key(pool_manager, &pool_id);
-            let seed_block = if own > 0 { own } else { snapshot_block };
-            verify_seed(seed, seed_block).await?;
+    let seed = {
+        let guard = core.read_at(degenbot_substrate::state_lock::LockSite::Registration);
+        guard
+            .v4_pool_id_by_key(pool_manager, &pool_id)
+            .and_then(|id| guard.get_v4_pool(id))
+            .and_then(|state| Some((state.snapshot_seed.clone()?, state.initial_tick_data_block?)))
+    };
+    if let Some((seed, block)) = seed {
+        verify_seed(seed.clone(), block).await?;
+        let mut guard = core.write_at(degenbot_substrate::state_lock::LockSite::Registration);
+        let unchanged = guard
+            .v4_pool_id_by_key(pool_manager, &pool_id)
+            .and_then(|id| guard.get_v4_pool(id))
+            .is_some_and(|state| {
+                state.initial_tick_data_block == Some(block)
+                    && state.snapshot_seed.as_ref() == Some(&seed)
+            });
+        if !unchanged {
+            return Ok(());
         }
+        guard.take_v4_snapshot_seed(pool_manager, &pool_id);
     }
 
     // Drain + pin under a SINGLE `core.write()` hold (step-2 race fix).
@@ -315,13 +311,11 @@ pub async fn run_v3_registration_lifecycle(
     core: &StateLock<BotState>,
     provider: Option<&AlloyProvider>,
     address: Address,
-    snapshot_block: Option<u64>,
 ) -> Result<(), RegistrationLifecycleError> {
     let provider = provider.cloned();
     run_cl_v3_lifecycle(
         core,
         address,
-        snapshot_block,
         |seed, block| {
             let provider = provider.clone();
             async move {
@@ -365,14 +359,12 @@ pub async fn run_v4_registration_lifecycle(
     provider: Option<&AlloyProvider>,
     pool_manager: Address,
     pool_id: V4PoolId,
-    snapshot_block: Option<u64>,
 ) -> Result<(), RegistrationLifecycleError> {
     let provider = provider.cloned();
     run_cl_v4_lifecycle(
         core,
         pool_manager,
         pool_id,
-        snapshot_block,
         |seed, block| {
             let provider = provider.clone();
             async move {
@@ -535,7 +527,6 @@ mod tests {
         let result = run_cl_v3_lifecycle::<_, _, _, _, ()>(
             &core,
             addr,
-            Some(123),
             |_, _| async move { unreachable!("no seed verify for Sparse") },
             |_, _| async move { unreachable!("no post-drain verify for Sparse") },
         )
@@ -559,7 +550,6 @@ mod tests {
             &core,
             pm,
             pid,
-            Some(123),
             |_, _| async move { unreachable!("no seed verify for Sparse") },
             |_, _| async move { unreachable!("no post-drain verify for Sparse") },
         )
@@ -584,7 +574,6 @@ mod tests {
         let result = run_cl_v3_lifecycle::<_, _, _, _, ()>(
             &core,
             addr,
-            Some(42),
             move |seed, block| {
                 let calls = calls_seed;
                 async move {
@@ -607,11 +596,9 @@ mod tests {
         let calls = calls.lock().unwrap();
         assert_eq!(calls.len(), 2, "both verify closures must run for Tracked");
         assert_eq!(calls[0].0, "seed");
-        assert_eq!(calls[0].1, 42, "seed verify runs @ snapshot block");
+        assert_eq!(calls[0].1, 0, "seed verify runs at its immutable horizon");
         assert_eq!(calls[1].0, "post");
-        // post-drain verify runs @ the pin's OWN block (the drain block), NOT
-        // the snapshot block 42 — the rolling-start race fix.
-        assert_ne!(calls[1].1, 42);
+        assert_eq!(calls[1].1, 0);
     }
 
     /// the reactivated wrong-block seed-verify regression:
@@ -661,7 +648,6 @@ mod tests {
         let result = run_cl_v3_lifecycle::<_, _, _, _, ()>(
             &core,
             addr,
-            Some(200), // global snapshot-seed block S
             move |seed, block| {
                 let calls = seed_calls;
                 async move {
@@ -682,6 +668,49 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn tracked_seed_rpc_failure_preserves_seed_and_horizon_for_retry() {
+        let core = new_core();
+        let address = Address::from([0x39u8; 20]);
+        let original = {
+            let mut guard = core.write_at(degenbot_substrate::state_lock::LockSite::Registration);
+            reg_v3(&mut guard, address, PoolTickCoverage::Tracked);
+            guard.v3_snapshot_seed(address).unwrap().clone()
+        };
+        let failed = run_cl_v3_lifecycle(
+            &core,
+            address,
+            |_, _| async { Err("temporary RPC failure") },
+            |_, _| async { unreachable!("seed verification failed") },
+        )
+        .await;
+        assert_eq!(failed, Err("temporary RPC failure"));
+        {
+            let mut guard = core.write_at(degenbot_substrate::state_lock::LockSite::Registration);
+            assert_eq!(guard.v3_snapshot_seed(address), Some(&original));
+            guard.buffer_backfill_v3_liquidity_update(address, 60, 120, 10, 5);
+        }
+        run_cl_v3_lifecycle::<_, _, _, _, ()>(
+            &core,
+            address,
+            |seed, block| async move {
+                assert_eq!(seed, original);
+                assert_eq!(block, 0);
+                Ok(())
+            },
+            |_, block| async move {
+                assert_eq!(block, 5);
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+        assert!(core
+            .read_at(degenbot_substrate::state_lock::LockSite::Registration)
+            .v3_snapshot_seed(address)
+            .is_none());
+    }
+
     /// A Tracked V3 pool whose seed verify mismatches must NEVER reach `Live`
     /// — the mismatch is the tripwire (ADR-022 D2, no auto-repair).
     #[tokio::test]
@@ -695,7 +724,6 @@ mod tests {
         let result = run_cl_v3_lifecycle::<_, _, _, _, String>(
             &core,
             addr,
-            Some(42),
             move |_, _| async move { Err("seed mismatch".to_string()) },
             move |_, _| async move { unreachable!("post-drain must not run after seed fail") },
         )
@@ -722,7 +750,6 @@ mod tests {
         let result = run_cl_v3_lifecycle::<_, _, _, _, String>(
             &core,
             addr,
-            Some(42),
             move |_, _| async move { Ok(()) },
             move |_, _| async move { Err("post-drain mismatch".to_string()) },
         )
@@ -766,7 +793,6 @@ mod tests {
         let result = run_cl_v3_lifecycle::<_, _, _, _, ()>(
             &core,
             addr,
-            None, // no snapshot block → step-1 skipped; step-2 (post-drain) still runs
             |_, _| async move { Ok(()) },
             |_, _| async move { Ok(()) },
         )
@@ -792,8 +818,7 @@ mod tests {
             let mut c = core.write_at(degenbot_substrate::state_lock::LockSite::Registration);
             reg_v4(&mut c, pm, pid, PoolTickCoverage::Tracked);
         }
-        let result =
-            crate::bot_core::run_v4_registration_lifecycle(&core, None, pm, pid, Some(42)).await;
+        let result = crate::bot_core::run_v4_registration_lifecycle(&core, None, pm, pid).await;
         assert!(matches!(
             result,
             Err(RegistrationLifecycleError::MissingProvider)
@@ -841,7 +866,6 @@ mod tests {
         run_cl_v3_lifecycle::<_, _, _, _, ()>(
             &core,
             tracked_addr,
-            Some(42),
             |_, _| async move { Ok(()) },
             |_, _| async move { Ok(()) },
         )
@@ -895,7 +919,6 @@ mod tests {
             run_cl_v3_lifecycle::<_, _, _, _, ()>(
                 &core_task,
                 addr,
-                Some(42),
                 move |_, _| async move { Ok(()) },
                 move |_, _| {
                     let started = started_tx;

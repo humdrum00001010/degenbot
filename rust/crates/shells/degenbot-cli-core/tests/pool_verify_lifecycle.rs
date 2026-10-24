@@ -63,6 +63,10 @@ struct StubNode {
 
 impl StubNode {
     fn spawn(chain_id: u64) -> Self {
+        Self::spawn_with_tick_maps(chain_id, true)
+    }
+
+    fn spawn_with_tick_maps(chain_id: u64, supports_tick_maps: bool) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let chain_id_reads = Arc::new(AtomicUsize::new(0));
@@ -74,7 +78,7 @@ impl StubNode {
             while !shutdown_flag.load(Ordering::Acquire) {
                 match listener.accept() {
                     Ok((mut stream, _addr)) => {
-                        let _ = answer(&mut stream, chain_id, &reads);
+                        let _ = answer(&mut stream, chain_id, &reads, supports_tick_maps);
                     }
                     Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(5));
@@ -105,7 +109,10 @@ fn answer(
     stream: &mut TcpStream,
     chain_id: u64,
     chain_id_reads: &AtomicUsize,
+    supports_tick_maps: bool,
 ) -> std::io::Result<()> {
+    // Darwin inherits the listener's nonblocking flag on accepted sockets.
+    stream.set_nonblocking(false)?;
     stream.set_read_timeout(Some(Duration::from_secs(10)))?;
     let mut buf = Vec::new();
     let mut chunk = [0u8; 4096];
@@ -144,9 +151,27 @@ fn answer(
     let payload = if method == "eth_chainId" {
         chain_id_reads.fetch_add(1, Ordering::AcqRel);
         serde_json::json!(format!("0x{chain_id:x}"))
+    } else if method == "erigon_getTickMaps" && supports_tick_maps {
+        let requested = &request["params"][0][0];
+        serde_json::json!({
+            "chainId": format!("0x{chain_id:x}"),
+            "blockNumber": request["params"][1],
+            "blockHash": format!("0x{}", "11".repeat(32)),
+            "pools": [{
+                "address": requested["address"],
+                "protocol": requested["protocol"],
+                "poolId": requested.get("poolId"),
+                "tickSpacing": requested["tickSpacing"],
+                "tick": 0,
+                "sqrtPriceX96": "0x1000000000000000000000000",
+                "liquidity": "0x0",
+                "protocolFee": 0,
+                "lpFee": 3000,
+                "ticks": [],
+            }],
+        })
     } else {
-        // The GREEN empty-map verify performs NO further reads; anything
-        // that does arrive is a refusal the run reports.
+        // Any unrelated method fails visibly.
         let error = serde_json::json!({"code": -32601, "message": "method not found"});
         let response = serde_json::json!({
             "jsonrpc": "2.0",
@@ -172,6 +197,43 @@ fn write_response(stream: &mut TcpStream, response: &serde_json::Value) -> std::
     stream.write_all(head.as_bytes())?;
     stream.write_all(body.as_bytes())?;
     stream.flush()
+}
+
+#[test]
+fn stub_waits_for_delayed_request_bytes_on_an_inherited_nonblocking_socket() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let (mut stream, _) = listener.accept().unwrap();
+    stream.set_nonblocking(true).unwrap();
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let worker = thread::spawn(move || {
+        ready_tx.send(()).unwrap();
+        let result = answer(&mut stream, CHAIN as u64, &AtomicUsize::new(0), true);
+        done_tx.send(result).unwrap();
+    });
+    ready_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    assert!(matches!(
+        done_rx.recv_timeout(Duration::from_millis(20)),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+    ));
+    let body = r#"{"jsonrpc":"2.0","id":7,"method":"eth_chainId","params":[]}"#;
+    let request = format!(
+        "POST / HTTP/1.1\r\nhost: localhost\r\ncontent-length: {}\r\n\r\n{body}",
+        body.len()
+    );
+    client.write_all(request.as_bytes()).unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .unwrap();
+    let mut response = String::new();
+    client.read_to_string(&mut response).unwrap();
+    done_rx
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap()
+        .unwrap();
+    worker.join().unwrap();
+    assert!(response.contains("0x2105"), "{response}");
 }
 
 fn env(rpc_url: &str) -> MapEnv {
@@ -227,7 +289,7 @@ fn seed_v4_pool(db_path: &Path) -> (String, String) {
     let manager = Address::repeat_byte(0x44);
     db.upsert_pool_manager(manager, CHAIN, "uniswap_v4", None, exchange.id)
         .unwrap();
-    let pool_hash = format!("0x{}", B256::from([0xAB; 32]));
+    let pool_hash = format!("{:#x}", B256::from([0xAB; 32]));
     db.upsert_v4_pools(
         CHAIN,
         &manager.to_checksum(None),
@@ -294,7 +356,7 @@ fn pool_verify_builds_one_provider_and_runs_the_gate_green() {
     assert_eq!(
         stub.chain_id_reads(),
         1,
-        "the chain bind reads the endpoint chain exactly once"
+        "the complete snapshot reuses the provider's cached chain identity"
     );
 }
 
@@ -391,4 +453,24 @@ fn pool_verify_without_a_verified_pool_never_builds_a_provider() {
         "a run that verifies nothing never builds a provider"
     );
     assert_eq!(stub.chain_id_reads(), 0, "no dial without work");
+}
+
+#[test]
+fn pool_verify_requires_erigon_even_when_the_catalog_has_no_tick_rows() {
+    let _guard = BUILD_COUNTER.lock().unwrap();
+    let stub = StubNode::spawn_with_tick_maps(CHAIN as u64, false);
+    let dir = TempDir::new().unwrap();
+    let db = dir.path().join("degenbot.db");
+    let pool = seed_v3_pool(&db);
+    let outcome = run(
+        &verify_command(&stub.url, pool.to_checksum(None), PoolFamily::V3, None),
+        &ctx_for(&stub.url, &db),
+        &NoPrompt,
+    );
+    assert_eq!(outcome.exit_code, ExitCode::Failure);
+    assert!(outcome
+        .error()
+        .unwrap()
+        .message()
+        .contains("method not found"));
 }

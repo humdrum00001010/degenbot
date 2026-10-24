@@ -35,6 +35,7 @@ from degenbot.db import db_upgrade_database
 from degenbot.erc20.erc20 import Erc20Token
 from degenbot.provider import OfflineProvider
 from degenbot.uniswap.concentrated.types import BitmapAtWord, LiquidityAtTick
+from degenbot.uniswap.math import get_sqrt_ratio_at_tick
 from degenbot.uniswap.v2_liquidity_pool import UniswapV2Pool
 from degenbot.uniswap.v2_types import UniswapV2PoolExternalUpdate
 from degenbot.uniswap.v3_liquidity_pool import UniswapV3Pool
@@ -448,7 +449,7 @@ class TestBotBuildV3Pool:
         usdc_addr = USDC_ADDR
         factory_addr = UNISWAP_V3_FACTORY
 
-        sqrt_price = 2198666895605149686863
+        sqrt_price = get_sqrt_ratio_at_tick(-76020)
         tick = -76020
         liquidity = 1234567890
 
@@ -568,7 +569,7 @@ class TestBotBuildV4Pool:
     """Bot.build_pool() constructs I/O-free V4 pools from on-chain data."""
 
     def test_build_pool_with_mock_provider(self, tmp_path: pathlib.Path) -> None:
-        sqrt_price = 2198666895605149686863
+        sqrt_price = get_sqrt_ratio_at_tick(-76020)
         tick = -76020
         protocol_fee = 0
         lp_fee = 500000

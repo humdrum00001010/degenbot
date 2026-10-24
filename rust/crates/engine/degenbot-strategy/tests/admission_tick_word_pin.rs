@@ -6,7 +6,7 @@
 //! Name-level pin for V3/V4 tick-word staging: the backrun strategy crate
 //! must reach tick maps only through the ingress or a journal-provenanced
 //! seed, never by fetching tick words itself on an admission path nor by
-//! fabricating a `TickMapSeed` literal to claim Db/Chain provenance (a
+//! fabricating a `TickMapSeed` literal to claim Chain provenance (a
 //! private seal field makes that a compile error; this pins the symbol-level
 //! intent too).
 //!
@@ -59,18 +59,17 @@ fn no_tick_word_fetch_lives_in_the_strategy_crate() {
 }
 
 #[test]
-fn strategy_crate_cannot_mint_db_or_chain_seed_provenance() {
+fn strategy_crate_cannot_mint_chain_seed_provenance() {
     for file in strategy_sources() {
         let text = fs::read_to_string(&file).expect("a strategy source is utf-8");
         for token in [
-            "TickMapSeed::db(",
             "TickMapSeed::chain(",
             "TickMapSeed::journal(",
             "TickMapSeed {",
         ] {
             assert!(
                 !text.contains(token),
-                "{} claims Db/Chain seed provenance ({token}); only degenbot_substrate::pool_ingress may mint it",
+                "{} claims Chain seed provenance ({token}); only degenbot_substrate::pool_ingress may mint it",
                 file.display()
             );
         }

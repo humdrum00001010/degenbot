@@ -88,7 +88,6 @@ pub(crate) fn run_v3_registration_lifecycle<'py>(
     py: Python<'py>,
     driver: &Arc<EngineDriver>,
     address: &str,
-    snapshot_block: Option<u64>,
 ) -> PyResult<Bound<'py, PyAny>> {
     let pool_addr: alloy::primitives::Address = address
         .parse()
@@ -96,7 +95,7 @@ pub(crate) fn run_v3_registration_lifecycle<'py>(
     let driver = Arc::clone(driver);
     crate::ambient_runtime::future_into_py(py, async move {
         driver
-            .run_v3_registration_lifecycle(pool_addr, snapshot_block)
+            .run_v3_registration_lifecycle(pool_addr)
             .await
             .map_err(map_driver_lifecycle_err)
     })
@@ -113,7 +112,6 @@ pub(crate) fn run_v4_registration_lifecycle<'py>(
     driver: &Arc<EngineDriver>,
     pool_manager_address: &str,
     pool_id_hex: &str,
-    snapshot_block: Option<u64>,
 ) -> PyResult<Bound<'py, PyAny>> {
     let pool_manager: alloy::primitives::Address = pool_manager_address
         .parse()
@@ -123,7 +121,7 @@ pub(crate) fn run_v4_registration_lifecycle<'py>(
     let driver = Arc::clone(driver);
     crate::ambient_runtime::future_into_py(py, async move {
         driver
-            .run_v4_registration_lifecycle(pool_manager, pool_id, snapshot_block)
+            .run_v4_registration_lifecycle(pool_manager, pool_id)
             .await
             .map_err(map_driver_lifecycle_err)
     })
@@ -139,7 +137,6 @@ pub(crate) fn run_v3_registration_lifecycle_blocking(
     py: Python<'_>,
     driver: &Arc<EngineDriver>,
     address: &str,
-    snapshot_block: Option<u64>,
 ) -> PyResult<()> {
     let pool_addr: alloy::primitives::Address = address
         .parse()
@@ -147,7 +144,7 @@ pub(crate) fn run_v3_registration_lifecycle_blocking(
     let driver = Arc::clone(driver);
     py.detach(move || {
         driver
-            .run_v3_registration_lifecycle_sync(pool_addr, snapshot_block)
+            .run_v3_registration_lifecycle_sync(pool_addr)
             .map_err(map_driver_lifecycle_err)
     })
 }
@@ -163,7 +160,6 @@ pub(crate) fn run_v4_registration_lifecycle_blocking(
     driver: &Arc<EngineDriver>,
     pool_manager_address: &str,
     pool_id_hex: &str,
-    snapshot_block: Option<u64>,
 ) -> PyResult<()> {
     let pool_manager: alloy::primitives::Address = pool_manager_address
         .parse()
@@ -173,7 +169,7 @@ pub(crate) fn run_v4_registration_lifecycle_blocking(
     let driver = Arc::clone(driver);
     py.detach(move || {
         driver
-            .run_v4_registration_lifecycle_sync(pool_manager, pool_id, snapshot_block)
+            .run_v4_registration_lifecycle_sync(pool_manager, pool_id)
             .map_err(map_driver_lifecycle_err)
     })
 }
@@ -192,7 +188,6 @@ pub(crate) fn run_v3_registration_lifecycle_with_retry_blocking(
     py: Python<'_>,
     driver: &Arc<EngineDriver>,
     address: &str,
-    snapshot_block: Option<u64>,
     policy: &crate::config::RetryPolicy,
 ) -> PyResult<()> {
     let pool_addr: alloy::primitives::Address = address
@@ -202,7 +197,7 @@ pub(crate) fn run_v3_registration_lifecycle_with_retry_blocking(
     let policy = policy.to_core();
     py.detach(move || {
         driver
-            .run_v3_registration_lifecycle_with_retry_sync(pool_addr, snapshot_block, &policy)
+            .run_v3_registration_lifecycle_with_retry_sync(pool_addr, &policy)
             .map_err(map_verify_lifecycle_error)
     })
 }
@@ -217,7 +212,6 @@ pub(crate) fn run_v4_registration_lifecycle_with_retry_blocking(
     driver: &Arc<EngineDriver>,
     pool_manager_address: &str,
     pool_id_hex: &str,
-    snapshot_block: Option<u64>,
     policy: &crate::config::RetryPolicy,
 ) -> PyResult<()> {
     let pool_manager: alloy::primitives::Address = pool_manager_address
@@ -229,12 +223,7 @@ pub(crate) fn run_v4_registration_lifecycle_with_retry_blocking(
     let policy = policy.to_core();
     py.detach(move || {
         driver
-            .run_v4_registration_lifecycle_with_retry_sync(
-                pool_manager,
-                pool_id,
-                snapshot_block,
-                &policy,
-            )
+            .run_v4_registration_lifecycle_with_retry_sync(pool_manager, pool_id, &policy)
             .map_err(map_verify_lifecycle_error)
     })
 }

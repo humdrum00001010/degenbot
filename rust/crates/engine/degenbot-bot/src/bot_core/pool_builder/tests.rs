@@ -12,10 +12,13 @@
 use hashbrown::HashMap;
 
 use alloy::dyn_abi::DynSolValue;
-use alloy::primitives::{aliases::U112, aliases::U128, Address, Bytes, FixedBytes, I256, U256};
+use alloy::primitives::{aliases::U112, Address, Bytes, FixedBytes, I256, U256};
 use async_trait::async_trait;
 use degenbot_core::errors::ProviderError;
 use degenbot_rpc::abi;
+use degenbot_rpc::tick_snapshot::{
+    PoolTickSnapshot, SnapshotTick, TickMapProtocol, TickMapRequest, TickMapSnapshot,
+};
 
 use super::{builder, choreography, curve_choreography};
 use crate::bot_core::construction_io::{ConstructionIo, NoDb, RpcConstruction};
@@ -52,6 +55,8 @@ fn str_ret(s: &str) -> Vec<u8> {
 }
 
 struct FakeRpc {
+    tick_snapshot: Option<Result<TickMapSnapshot, ProviderError>>,
+    tick_request: Option<TickMapRequest>,
     responses: HashMap<[u8; 4], Vec<u8>>,
     // Parameterized calls (e.g. `coins(uint256)` keyed by index) need the full
     // calldata, not just the selector; checked first, falls back to the
@@ -68,6 +73,8 @@ struct FakeRpc {
 impl FakeRpc {
     fn new() -> Self {
         Self {
+            tick_snapshot: None,
+            tick_request: None,
             responses: HashMap::new(),
             responses_full: HashMap::new(),
             code: Bytes::new(),
@@ -92,13 +99,35 @@ impl FakeRpc {
 #[async_trait]
 impl RpcConstruction for FakeRpc {
     async fn get_block_number(&self) -> Result<u64, ProviderError> {
-        Ok(0)
+        Ok(if self.tick_snapshot.is_some() { 500 } else { 0 })
     }
     async fn get_block(
         &self,
-        _b: u64,
+        b: u64,
     ) -> Result<Option<degenbot_rpc::provider::EthBlock>, ProviderError> {
-        Ok(None)
+        if self.tick_snapshot.is_none() {
+            return Ok(None);
+        }
+        assert_eq!(b, 500);
+        let mut block = degenbot_rpc::provider::EthBlock::default();
+        block.header.inner.number = 500;
+        block.header.hash = alloy::primitives::B256::repeat_byte(7);
+        Ok(Some(block))
+    }
+    async fn get_tick_maps(
+        &self,
+        requests: &[TickMapRequest],
+        block: alloy::eips::BlockId,
+    ) -> Result<TickMapSnapshot, ProviderError> {
+        assert_eq!(requests, &[self.tick_request.unwrap()]);
+        assert_eq!(
+            block,
+            alloy::eips::BlockId::Hash(alloy::eips::RpcBlockHash {
+                block_hash: alloy::primitives::B256::repeat_byte(7),
+                require_canonical: Some(true),
+            })
+        );
+        self.tick_snapshot.clone().unwrap()
     }
     async fn get_block_timestamp(&self, _b: u64) -> Result<Option<u64>, ProviderError> {
         Ok(None)
@@ -113,8 +142,15 @@ impl RpcConstruction for FakeRpc {
         &self,
         _to: Address,
         data: Bytes,
-        _block: Option<u64>,
+        block: Option<u64>,
     ) -> Result<Bytes, ProviderError> {
+        if self.tick_snapshot.is_some() {
+            assert_eq!(block, Some(500));
+            assert!(
+                self.responses.contains_key(&data[..4]),
+                "unexpected incremental read"
+            );
+        }
         // A configured hard failure wins over any response: this models an
         // RPC/transport fault, not an EVM revert.
         if let Some(e) = self.errors.get(&data[..4]) {
@@ -762,312 +798,155 @@ async fn build_v2_assembles_register_params_from_onchain() {
     assert_eq!(state.reserve0, U112::from(123_456_789u64));
 }
 
-#[tokio::test]
-async fn build_v3_assembles_sparse_register_params_from_onchain() {
-    use crate::bot_core::PoolTickCoverage;
-    // Fake factory NOT in the JSON → CREATE2 verify is skipped (ad-hoc path).
-    let factory: Address =
-        alloy::primitives::address!("0x1111111111111111111111111111111111111111");
-    let tok0: Address = alloy::primitives::address!("0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48");
-    let tok1: Address = alloy::primitives::address!("0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2");
-    let pool: Address = alloy::primitives::address!("0x2222222222222222222222222222222222222222");
-
-    let mut f = FakeRpc::new();
-    f.set(choreography::selector(b"factory()"), addr_word(factory));
-    f.set(choreography::selector(b"token0()"), addr_word(tok0));
-    f.set(choreography::selector(b"token1()"), addr_word(tok1));
-    f.set(
+fn bulk_fake(protocol: TickMapProtocol, empty: bool) -> FakeRpc {
+    let mut fake = FakeRpc::new();
+    fake.set(choreography::selector(b"factory()"), addr_word(TO));
+    fake.set(choreography::selector(b"token0()"), addr_word(TO));
+    fake.set(choreography::selector(b"token1()"), addr_word(SV));
+    fake.set(
         choreography::selector(b"fee()"),
-        enc(DynSolValue::Uint(U256::from(3000u32), 24)),
+        enc(DynSolValue::Uint(U256::from(500), 24)),
     );
-    f.set(
+    fake.set(
         choreography::selector(b"tickSpacing()"),
-        enc(DynSolValue::Int(I256::try_from(60i32).unwrap(), 24)),
+        enc(DynSolValue::Int(I256::ONE, 24)),
     );
-    f.set(
-        abi::encode_slot0()[..4].try_into().unwrap(),
-        slot0_ret(U256::from(1u128 << 96), 0),
-    );
-    f.set(
-        abi::encode_liquidity()[..4].try_into().unwrap(),
-        enc(DynSolValue::Uint(U256::from(1_000_000_000u64), 128)),
-    );
-    // tick=0, spacing=60 → word 0; zero bitmap → sparse, no per-tick reads.
-    f.set(
-        abi::encode_tick_bitmap(0)[..4].try_into().unwrap(),
-        enc(DynSolValue::Uint(U256::ZERO, 256)),
-    );
-    let io = io_with(f);
-
-    let params = builder::build_v3(1, pool, None, &io, Some(9_000_000))
-        .await
-        .unwrap();
-    assert_eq!(params.address, pool);
-    assert_eq!(params.token0, tok0);
-    assert_eq!(params.token1, tok1);
-    assert_eq!(params.fee, 3000);
-    assert_eq!(params.tick_spacing, 60);
-    assert_eq!(params.factory, factory);
-    assert_eq!(params.tick, 0);
-    assert_eq!(params.update_block, 9_000_000);
-    assert_eq!(params.tick_data_block, Some(9_000_000));
-    assert_eq!(params.coverage, PoolTickCoverage::Sparse);
-    assert!(params.tick_data.is_empty());
-}
-
-#[tokio::test]
-async fn build_v4_assembles_sparse_register_params_from_onchain() {
-    use crate::bot_core::PoolTickCoverage;
-    let pm: Address = alloy::primitives::address!("0x3333333333333333333333333333333333333333");
-    let pid: [u8; 32] = [0xcd; 32];
-
-    let mut f = FakeRpc::new();
-    f.set(
-        abi::encode_get_slot0(&pid)[..4].try_into().unwrap(),
-        enc(DynSolValue::Tuple(vec![
-            DynSolValue::Uint(U256::from(1u128 << 96), 160),
-            DynSolValue::Int(I256::try_from(5i32).unwrap(), 24),
-            DynSolValue::Uint(U256::from(300u32), 24), // protocol_fee
-            DynSolValue::Uint(U256::from(50u32), 24),  // lp_fee
-        ])),
-    );
-    f.set(
-        abi::encode_get_liquidity(&pid)[..4].try_into().unwrap(),
-        enc(DynSolValue::Uint(U256::from(2_000_000_000u64), 128)),
-    );
-    // tick=5, spacing=1 -> word 0; zero bitmap -> sparse, no per-tick reads.
-    f.set(
-        abi::encode_v4_tick_bitmap(&pid, 0)[..4].try_into().unwrap(),
-        enc(DynSolValue::Uint(U256::ZERO, 256)),
-    );
-    let io = io_with(f);
-
-    let hook_addr = alloy::primitives::address!("0x99999999990a45c0ab9ec7e4b076dcfa05898f48");
-    let result = builder::build_v4(
-        builder::V4PoolBuildIdentity {
-            pool_manager: pm,
-            state_view: pm,
-            pool_id: pid,
-            currency0: TO,
-            currency1: SV,
-            fee: 500,
+    let pool_id = (protocol == TickMapProtocol::UniswapV4).then_some(POOL_ID.into());
+    fake.tick_request = Some(TickMapRequest {
+        address: TO,
+        protocol,
+        tick_spacing: 1,
+        pool_id,
+    });
+    fake.tick_snapshot = Some(Ok(TickMapSnapshot {
+        chain_id: 1,
+        block_number: 500,
+        block_hash: alloy::primitives::B256::repeat_byte(7),
+        pools: vec![PoolTickSnapshot {
+            address: TO,
+            protocol,
             tick_spacing: 1,
-            hook_address: hook_addr,
-        },
-        None,
-        &io,
-        Some(11_000_000),
-    )
-    .await
-    .unwrap();
-    let params = &result.params;
-    assert_eq!(params.pool_manager, pm);
-    assert_eq!(params.pool_id, pid);
-    assert_eq!(params.pool_key.currency0, TO);
-    assert_eq!(params.pool_key.currency1, SV);
-    assert_eq!(params.pool_key.fee, 500);
-    assert_eq!(params.pool_key.tick_spacing, 1);
-    // Regression (pool-ID mismatch incident): the registered pool key must
-    // carry the REAL hook address, not Address::ZERO — the Python companion
-    // re-derives pool_id = keccak(pool_key) from this identity.
-    assert_eq!(params.pool_key.hooks, hook_addr);
-    assert_eq!(params.hook_flags, builder::derive_hook_flags(hook_addr));
-    assert_eq!(params.protocol_fee, 300);
-    assert_eq!(params.tick, 5);
-    assert_eq!(params.coverage, PoolTickCoverage::Sparse);
-    assert!(params.tick_data.is_empty());
-    // lp_fee is no longer discarded - returned from the SAME
-    // head-stamped slot0 read as protocol_fee (mock slot0 has lp_fee=50).
-    assert_eq!(result.lp_fee, 50);
+            pool_id,
+            tick: 0,
+            sqrt_price_x96: U256::from(1u128 << 96),
+            liquidity: if empty { 0 } else { 100 },
+            protocol_fee: 300,
+            lp_fee: 50,
+            ticks: if empty {
+                vec![]
+            } else {
+                vec![
+                    SnapshotTick {
+                        tick: -300,
+                        liquidity_gross: 100,
+                        liquidity_net: 100,
+                    },
+                    SnapshotTick {
+                        tick: 600,
+                        liquidity_gross: 100,
+                        liquidity_net: -100,
+                    },
+                ]
+            },
+        }],
+    }));
+    fake
 }
 
-/// A `TickMapDb` fake returning a canned `LiquidityMap` (V3 + V4 both query it).
-struct FakeTickMapDb(degenbot_db::snapshot::LiquidityMap, Option<i64>);
-
-impl degenbot_db::snapshot::TickMapDb for FakeTickMapDb {
-    fn fetch_liquidity_map(
-        &self,
-        _address: Address,
-    ) -> Result<Option<degenbot_db::snapshot::LiquidityMap>, degenbot_db::error::DbError> {
-        Ok(Some(self.0.clone()))
-    }
-    fn fetch_liquidity_map_v4(
-        &self,
-        _pool_manager: Address,
-        _pool_id_hash: alloy::primitives::B256,
-    ) -> Result<Option<degenbot_db::snapshot::LiquidityMap>, degenbot_db::error::DbError> {
-        Ok(Some(self.0.clone()))
-    }
-    fn fetch_newest_update_block(
-        &self,
-        _chain: i64,
-        _family: degenbot_db::read::ExchangeFamily,
-    ) -> Result<Option<i64>, degenbot_db::error::DbError> {
-        Ok(None)
-    }
-    fn fetch_liquidity_update_block(
-        &self,
-        _address: Address,
-    ) -> Result<Option<i64>, degenbot_db::error::DbError> {
-        Ok(self.1)
-    }
-    fn fetch_liquidity_update_block_v4(
-        &self,
-        _pool_manager: Address,
-        _pool_id_hash: alloy::primitives::B256,
-    ) -> Result<Option<i64>, degenbot_db::error::DbError> {
-        Ok(self.1)
-    }
-}
-
-/// A DB hit gives a TRACKED pool : the builder
-/// favors the `TickMapDb` full tick map (Tracked → feeds the verify lifecycle)
-/// over the chain-arm single-word bootstrap, and must NOT consult the chain
-/// (no `tick_bitmap` response is seeded, so a chain probe would error).
 #[tokio::test]
-async fn build_v3_db_hit_yields_tracked_without_chain() {
+async fn build_v3_pins_complete_multiword_maps_and_tracks_empty_maps() {
     use crate::bot_core::PoolTickCoverage;
-    use degenbot_db::snapshot::{BitmapAtWord, LiquidityAtTick, LiquidityMap};
-    use hashbrown::HashMap;
+    use degenbot_pools::v3_state::ClSlotLayout;
+    for (layout, empty) in [
+        (ClSlotLayout::UniswapV3, false),
+        (ClSlotLayout::PancakeV3, false),
+        (ClSlotLayout::UniswapV3, true),
+    ] {
+        let protocol = if layout == ClSlotLayout::PancakeV3 {
+            TickMapProtocol::PancakeV3
+        } else {
+            TickMapProtocol::UniswapV3
+        };
+        let io = io_with(bulk_fake(protocol, empty));
+        let params = builder::build_v3(1, TO, &io, None, Some(layout))
+            .await
+            .unwrap();
+        assert_eq!(params.coverage, PoolTickCoverage::Tracked);
+        assert_eq!(params.slot_layout, layout);
+        assert_eq!(params.liquidity, if empty { 0 } else { 100 });
+        assert_eq!(params.sqrt_price_x96, U256::from(1u128 << 96));
+        assert_eq!(params.tick_data.len(), if empty { 0 } else { 2 });
+        if !empty {
+            assert_eq!(params.tick_data[&-300].liquidity_net, 100);
+            assert_eq!(params.tick_data[&600].liquidity_net, -100);
+        }
+        assert!(params.tick_data.values().all(|tick| tick.block == 500));
+        assert_eq!(
+            (params.update_block, params.tick_data_block),
+            (500, Some(500))
+        );
+        assert!(params.fetcher.is_none());
+    }
+}
 
-    let factory: Address =
-        alloy::primitives::address!("0x1111111111111111111111111111111111111111");
-    let tok0: Address = alloy::primitives::address!("0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48");
-    let tok1: Address = alloy::primitives::address!("0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2");
-    let pool: Address = alloy::primitives::address!("0x2222222222222222222222222222222222222222");
-
-    let mut f = FakeRpc::new();
-    f.set(choreography::selector(b"factory()"), addr_word(factory));
-    f.set(choreography::selector(b"token0()"), addr_word(tok0));
-    f.set(choreography::selector(b"token1()"), addr_word(tok1));
-    f.set(
-        choreography::selector(b"fee()"),
-        enc(DynSolValue::Uint(U256::from(3000u32), 24)),
-    );
-    f.set(
-        choreography::selector(b"tickSpacing()"),
-        enc(DynSolValue::Int(I256::try_from(60i32).unwrap(), 24)),
-    );
-    f.set(
-        abi::encode_slot0()[..4].try_into().unwrap(),
-        slot0_ret(U256::from(1u128 << 96), 0),
-    );
-    f.set(
-        abi::encode_liquidity()[..4].try_into().unwrap(),
-        enc(DynSolValue::Uint(U256::from(1_000_000_000u64), 128)),
-    );
-    // NOTE: no tick_bitmap response — if the chain arm were reached it would error.
-    let io = io_with(f);
-
-    let db = FakeTickMapDb(
-        LiquidityMap {
-            tick_bitmap: HashMap::from([(
-                0i64,
-                // bit 1 = tick 60 at spacing 60 (intake
-                // reconciliation: bit position = tick / spacing).
-                BitmapAtWord {
-                    bitmap: U256::from(1u128) << 1,
-                },
-            )]),
-            tick_data: HashMap::from([(
-                60,
-                LiquidityAtTick {
-                    liquidity_gross: U256::from(100u64),
-                    liquidity_net: 100i128,
-                },
-            )]),
-        },
-        None,
-    );
-
-    let params = builder::build_v3(1, pool, Some(&db), &io, Some(9_000_000))
+#[tokio::test]
+async fn build_v4_uses_manager_snapshot_scalars_and_tracks_empty_maps() {
+    use crate::bot_core::PoolTickCoverage;
+    for empty in [false, true] {
+        let io = io_with(bulk_fake(TickMapProtocol::UniswapV4, empty));
+        let built = builder::build_v4(
+            builder::V4PoolBuildIdentity {
+                pool_manager: TO,
+                state_view: SV,
+                pool_id: POOL_ID,
+                currency0: TO,
+                currency1: SV,
+                fee: 500,
+                tick_spacing: 1,
+                hook_address: Address::ZERO,
+            },
+            &io,
+            Some(500),
+        )
         .await
         .unwrap();
-    assert_eq!(params.coverage, PoolTickCoverage::Tracked);
-    assert_eq!(params.tick_data.len(), 1);
-    assert_eq!(params.tick_data[&60].liquidity_gross, U128::from(100u64));
-    assert_eq!(params.tick_data[&60].liquidity_net, 100i128);
+        assert_eq!(built.params.coverage, PoolTickCoverage::Tracked);
+        assert_eq!(built.params.tick_data.len(), if empty { 0 } else { 2 });
+        assert_eq!(built.params.liquidity, if empty { 0 } else { 100 });
+        assert_eq!(built.params.protocol_fee, 300);
+        assert_eq!(built.lp_fee, 50);
+        assert_eq!(
+            (built.params.update_block, built.params.tick_data_block),
+            (500, Some(500))
+        );
+        assert!(built.params.fetcher.is_none());
+    }
 }
 
-/// a DB-seeded (`Tracked`) pool's LIQUIDITY clock
-/// (`tick_data_block`) must be the DB `liquidity_update_block`, NOT the
-/// caller-supplied head price clock. Before the fix the builder stamped
-/// `tick_data_block = update_block = head`, so the seed/post-drain verify
-/// compared stale DB seed data against on-chain at head and fabricated a
-/// mismatch (regression 8c50e0cd).
 #[tokio::test]
-async fn build_v3_db_hit_stamps_tick_data_block_at_db_liquidity_update_block() {
-    use crate::bot_core::PoolTickCoverage;
-    use degenbot_db::snapshot::{BitmapAtWord, LiquidityAtTick, LiquidityMap};
-    use hashbrown::HashMap;
-
-    let factory: Address =
-        alloy::primitives::address!("0x1111111111111111111111111111111111111111");
-    let tok0: Address = alloy::primitives::address!("0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48");
-    let tok1: Address = alloy::primitives::address!("0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2");
-    let pool: Address = alloy::primitives::address!("0x2222222222222222222222222222222222222222");
-
-    let mut f = FakeRpc::new();
-    f.set(choreography::selector(b"factory()"), addr_word(factory));
-    f.set(choreography::selector(b"token0()"), addr_word(tok0));
-    f.set(choreography::selector(b"token1()"), addr_word(tok1));
-    f.set(
-        choreography::selector(b"fee()"),
-        enc(DynSolValue::Uint(U256::from(3000u32), 24)),
-    );
-    f.set(
-        choreography::selector(b"tickSpacing()"),
-        enc(DynSolValue::Int(I256::try_from(60i32).unwrap(), 24)),
-    );
-    f.set(
-        abi::encode_slot0()[..4].try_into().unwrap(),
-        slot0_ret(U256::from(1u128 << 96), 0),
-    );
-    f.set(
-        abi::encode_liquidity()[..4].try_into().unwrap(),
-        enc(DynSolValue::Uint(U256::from(1_000_000u64), 128)),
-    );
-    let io = io_with(f);
-
-    // DB-seeded pool whose liquidity map is exact at block 123.
-    let db = FakeTickMapDb(
-        LiquidityMap {
-            tick_bitmap: HashMap::from([(
-                0i64,
-                // bit 1 = tick 60 at spacing 60 (intake
-                // reconciliation: bit position = tick / spacing).
-                BitmapAtWord {
-                    bitmap: U256::from(1u128) << 1,
-                },
-            )]),
-            tick_data: HashMap::from([(
-                60,
-                LiquidityAtTick {
-                    liquidity_gross: U256::from(100u64),
-                    liquidity_net: 100i128,
-                },
-            )]),
-        },
-        Some(123),
-    );
-
-    // Caller-supplied build block (the live head price clock) = 9_000_000.
-    let params = builder::build_v3(1, pool, Some(&db), &io, Some(9_000_000))
-        .await
-        .unwrap();
-    assert_eq!(params.coverage, PoolTickCoverage::Tracked);
-    assert_eq!(
-        params.tick_data_block,
-        Some(123),
-        "DB-seeded pool's liquidity clock must be the DB liquidity_update_block, not the head"
-    );
-    assert_eq!(
-        params.update_block, 9_000_000,
-        "the PRICE clock stays at the fresh head read (two-stamp rule)"
-    );
+async fn build_v3_rejects_provider_failure_and_mismatched_snapshot() {
+    for mismatch in 0..7 {
+        let mut fake = bulk_fake(TickMapProtocol::UniswapV3, false);
+        if mismatch == 0 {
+            fake.tick_snapshot = Some(Err(ProviderError::DecodingError {
+                message: "unsupported RPC".into(),
+            }));
+        } else {
+            let snapshot = fake.tick_snapshot.as_mut().unwrap().as_mut().unwrap();
+            match mismatch {
+                1 => snapshot.chain_id = 2,
+                2 => snapshot.block_number = 499,
+                3 => snapshot.block_hash = alloy::primitives::B256::ZERO,
+                4 => snapshot.pools[0].address = SV,
+                5 => snapshot.pools.clear(),
+                _ => snapshot.pools[0].ticks.clear(),
+            }
+        }
+        assert!(builder::build_v3(1, TO, &io_with(fake), Some(500), None)
+            .await
+            .is_err());
+    }
 }
-
-// --- Balancer choreography + builder decode tests -------------------
 
 fn pool_id_ret(pool_id: &[u8; 32]) -> Vec<u8> {
     enc(DynSolValue::FixedBytes(FixedBytes::from(*pool_id), 32))
@@ -1914,7 +1793,7 @@ use crate::bot_core::pool_builder::route;
 use crate::bot_core::{Bot, RegisteredPoolFamily};
 use degenbot_substrate::state_lock::LockSite;
 
-fn v3_route() -> route::V3RouteInputs<'static> {
+fn v3_route() -> route::V3RouteInputs {
     route::V3RouteInputs::default()
 }
 
@@ -1989,39 +1868,11 @@ async fn route_unserved_factory_refuses_loud() {
 
 #[tokio::test]
 async fn route_matched_rung_builds_and_registers() {
-    // The route walk answers a served factory with a CONSTRUCTED, REGISTERED
-    // pool: one immutable batch, the seeded build, one registration.
-    let factory: Address =
-        alloy::primitives::address!("0x1111111111111111111111111111111111111111");
-    let tok0: Address = alloy::primitives::address!("0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48");
-    let tok1: Address = alloy::primitives::address!("0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2");
-    let pool: Address = alloy::primitives::address!("0x2222222222222222222222222222222222222222");
-
-    let mut f = FakeRpc::new();
-    f.set(choreography::selector(b"factory()"), addr_word(factory));
-    f.set(choreography::selector(b"token0()"), addr_word(tok0));
-    f.set(choreography::selector(b"token1()"), addr_word(tok1));
-    f.set(
-        choreography::selector(b"fee()"),
-        enc(DynSolValue::Uint(U256::from(3000u32), 24)),
-    );
-    f.set(
-        choreography::selector(b"tickSpacing()"),
-        enc(DynSolValue::Int(I256::try_from(60i32).unwrap(), 24)),
-    );
-    f.set(
-        abi::encode_slot0()[..4].try_into().unwrap(),
-        slot0_ret(U256::from(1u128 << 96), 0),
-    );
-    f.set(
-        abi::encode_liquidity()[..4].try_into().unwrap(),
-        enc(DynSolValue::Uint(U256::from(1_000_000_000u64), 128)),
-    );
-    f.set(
-        abi::encode_tick_bitmap(0)[..4].try_into().unwrap(),
-        enc(DynSolValue::Uint(U256::ZERO, 256)),
-    );
-    let io = io_with(f);
+    let factory = TO;
+    let tok0 = TO;
+    let tok1 = SV;
+    let pool = TO;
+    let io = io_with(bulk_fake(TickMapProtocol::UniswapV3, true));
     let bot = Bot::new(1);
 
     let built = route::construct_pool(
@@ -2030,7 +1881,7 @@ async fn route_matched_rung_builds_and_registers() {
         &route::RequestedPool::V3 { address: pool },
         &io,
         v3_route(),
-        Some(9_000_000),
+        Some(500),
     )
     .await
     .expect("a served factory constructs and registers");
@@ -2056,7 +1907,7 @@ async fn route_matched_rung_builds_and_registers() {
         &route::RequestedPool::V3 { address: pool },
         &io_down,
         v3_route(),
-        Some(9_000_000),
+        Some(500),
     )
     .await
     .expect("a registered pool answers from the registry");

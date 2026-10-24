@@ -441,7 +441,6 @@ pub async fn admit_extracted_verified(
                 let p_id = match solver
                     .admit_v4_replay(
                         st.address,
-                        edge.state_view,
                         edge.token0,
                         edge.token1,
                         *pool_id,
@@ -694,7 +693,6 @@ async fn admit_hop_pool(
                     token1,
                     e.fee,
                     e.tick_spacing,
-                    None,
                     head,
                     e.layout,
                     rt.ingress(),

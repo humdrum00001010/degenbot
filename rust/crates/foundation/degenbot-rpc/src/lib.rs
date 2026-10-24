@@ -32,9 +32,11 @@ pub mod offline;
 pub mod pending_tx_stream;
 pub mod provider;
 pub mod subscription;
-pub mod tick_bootstrap;
+pub mod tick_snapshot;
 pub mod txpool_feed;
 
 pub use fees::{fetch_priority_fee_percentiles, BlockPriorityFees};
 pub use head_watch::{HeadWatch, HeadWatchConfig, HeadWatchError};
-pub use tick_bootstrap::AlloyTickBootstrapRpc;
+pub use tick_snapshot::{
+    PoolTickSnapshot, SnapshotTick, TickMapProtocol, TickMapRequest, TickMapSnapshot,
+};

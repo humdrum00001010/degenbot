@@ -133,10 +133,7 @@ pub use rate_provider::{BalancerRateProvider, RateProviderError, StaticRateProvi
 pub use spec_bounds::{SpecValue, SpecViolation};
 pub use state_history::ReorgPoolState;
 pub use tick_bitmap::V3TickRangeForSolver;
-pub use tick_fetch::{
-    BootstrapTickError, BootstrapTickWord, FetchTickWordError, FetchedTickWord, TickBootstrapRpc,
-    TickWordFetcher,
-};
+pub use tick_fetch::{FetchTickWordError, FetchedTickWord, TickWordFetcher};
 
 pub use pool::{
     BalanceVectorVariant, BalanceVectorView, BinnedLiquidityVariant, ConcentratedLiquidityVariant,

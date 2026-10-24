@@ -39,13 +39,11 @@ def _restore_sigint() -> None:
 
 
 def _cfg() -> ArbitrageConfig:
-    with identity_env(
-        {
-            "OPERATOR_ADDRESS": "0x9C56a29c7231974c269E24F9FB3c29203039089E",
-            "OPERATOR_PRIVATE_KEY": "0x" + "a" * 64,
-            "EXECUTOR_CONTRACT_ADDRESS": "0x543C7eF4F2368a9411c94A055e7236E6Dc6f99D5",
-        }
-    ):
+    with identity_env({
+        "OPERATOR_ADDRESS": "0x9C56a29c7231974c269E24F9FB3c29203039089E",
+        "OPERATOR_PRIVATE_KEY": "0x" + "a" * 64,
+        "EXECUTOR_CONTRACT_ADDRESS": "0x543C7eF4F2368a9411c94A055e7236E6Dc6f99D5",
+    }):
         return ArbitrageConfig.build(live=True, permutation=None)
 
 
@@ -76,11 +74,11 @@ class _FakeAsyncW3:
 def _session() -> BotRunner:
     return BotRunner(
         _cfg(),
-        actors=InjectedActors(settlement_arm=True, 
+        actors=InjectedActors(
+            settlement_arm=True,
             bot=_FakeBot(),
             engine_registry=_FakeEngineRegistry(),
             async_w3=_FakeAsyncW3(),
-            snapshots=(object(), object(), None, None),
             path_builder=lambda **kw: _noop(),
             consumer=lambda **kw: _noop(),
             relay_posture=RelayPosture(relay_urls=["http://offline-test.relay"]),

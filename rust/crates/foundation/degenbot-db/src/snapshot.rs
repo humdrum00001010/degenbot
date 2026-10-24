@@ -160,10 +160,8 @@ impl DegenbotDb {
     /// version (V3: address order; V4: `(pm_address, pool_hash)` order). A
     /// chain with no pools invokes the callback zero times.
     ///
-    /// Used by the core `Bot::load_snapshot_from_db` to feed a
-    /// `SnapshotStore::insert` one pool at a time, mirroring Python's
-    /// `yield_per` streaming shape and avoiding transient ~2× peak RSS
-    /// (the materialized `Vec` + the engine `HashMap` coexisting).
+    /// Streams persisted rows for database inspection without materializing
+    /// every pool's map in memory at once.
     ///
     /// # Errors
     ///

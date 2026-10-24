@@ -108,30 +108,6 @@ class _FakeBot:
         return _BlocksStream(list(self._blocks))
 
 
-class _RecordingPyBot:
-    """A stand-in for the Rust ``Bot._py_bot`` whose ``close_snapshot_tx``
-    records invocation (and optionally trips the canary RuntimeError,
-    as the real one does when in-flight build workers hold an ``Arc`` clone)."""
-
-    def __init__(
-        self,
-        events: list[str],
-        *,
-        raise_on_close: bool = False,
-    ) -> None:
-        self._events = events
-        self._raise_on_close = raise_on_close
-
-    def close_snapshot_tx(self) -> None:
-        self._events.append("close_snapshot_tx")
-        if self._raise_on_close:
-            msg = (
-                "close_snapshot_tx: SnapshotDb Arc still held "
-                "(clone leak \u2014 a caller didn't drop its handle)"
-            )
-            raise RuntimeError(msg)
-
-
 class _FakeEth:
     def __init__(self, *, block_number: int = 12_345, nonce: int = 7) -> None:
         self._block_number = block_number
@@ -248,8 +224,6 @@ class TestBotRunnerStart:
         bot = _FakeBot()
         engine_registry = _FakeEngineRegistry(backfill_target=12_000)
         async_w3 = _FakeAsyncW3()
-        v3_snap, v4_snap = object(), object()
-        snapshots = (v3_snap, v4_snap, None, None)
 
         session = BotRunner(
             _cfg(),
@@ -258,7 +232,6 @@ class TestBotRunnerStart:
                 bot=bot,
                 engine_registry=engine_registry,
                 async_w3=async_w3,
-                snapshots=snapshots,
                 path_builder=_Recorder(events, "path_builder"),
                 consumer=_Recorder(events, "consumer"),
                 relay_posture=RelayPosture(relay_urls=["http://offline-test.relay"]),
@@ -268,13 +241,11 @@ class TestBotRunnerStart:
 
         await session.start()
 
-        # engine_registry.start called with cfg's node URLs + the injected snapshots
+        # The registry starts from the configured node URLs.
         assert len(engine_registry.start_calls) == 1
         call = engine_registry.start_calls[0]
         assert call["node_http"] == _NODE
         assert call["node_ws"] == _NODE
-        assert call["v3_snapshot"] is v3_snap
-        assert call["v4_snapshot"] is v4_snap
         # verify_state_view is the V4 state view constant (non-empty)
         assert call["verify_state_view"].startswith("0x")
 
@@ -296,7 +267,6 @@ class TestBotRunnerStart:
                 bot=bot,
                 engine_registry=engine_registry,
                 async_w3=async_w3,
-                snapshots=(None, None, None, None),
                 path_builder=lambda **kw: _noop_coro(),
                 consumer=lambda **kw: _noop_coro(),
                 relay_posture=RelayPosture(relay_urls=["http://offline-test.relay"]),
@@ -314,7 +284,6 @@ class TestBotRunnerRun:
         bot = _FakeBot(events=events)
         engine_registry = _FakeEngineRegistry(backfill_target=12_000, events=events)
         async_w3 = _FakeAsyncW3()
-        v3_snap, v4_snap = object(), object()
 
         session = BotRunner(
             _cfg(),
@@ -323,7 +292,6 @@ class TestBotRunnerRun:
                 bot=bot,
                 engine_registry=engine_registry,
                 async_w3=async_w3,
-                snapshots=(v3_snap, v4_snap, None, None),
                 path_builder=_Recorder(events, "path_builder"),
                 consumer=_Recorder(events, "consumer"),
                 relay_posture=RelayPosture(relay_urls=["http://offline-test.relay"]),
@@ -352,7 +320,6 @@ class TestBotRunnerRun:
                 bot=bot,
                 engine_registry=engine_registry,
                 async_w3=async_w3,
-                snapshots=(None, None, None, None),
                 path_builder=lambda **kw: _noop_coro(),
                 consumer=lambda **kw: _noop_coro(),
                 relay_posture=RelayPosture(relay_urls=["http://offline-test.relay"]),
@@ -387,7 +354,6 @@ class TestBotRunnerRun:
                 bot=bot,
                 engine_registry=engine_registry,
                 async_w3=async_w3,
-                snapshots=(None, None, None, None),
                 path_builder=raising_path_builder,
                 consumer=hanging_consumer,
                 relay_posture=RelayPosture(relay_urls=["http://offline-test.relay"]),
@@ -423,7 +389,6 @@ class TestSessionPhaseMachine:
             "bot": _FakeBot(),
             "engine_registry": _FakeEngineRegistry(),
             "async_w3": _FakeAsyncW3(),
-            "snapshots": (None, None, None, None),
             "path_builder": lambda **_kw: _noop_coro(),
             "consumer": lambda **_kw: _noop_coro(),
             "relay_posture": RelayPosture(relay_urls=["http://offline-test.relay"]),
@@ -554,9 +519,7 @@ class TestBotRunnerRunBlockStreamAcquiredOnce:
             def __init__(self) -> None:
                 self.engine = _FakeEngine()
 
-            def start(
-                self, node_http, node_ws, *, v3_snapshot, v4_snapshot, verify_state_view
-            ) -> int:
+            def start(self, node_http, node_ws, *, verify_state_view) -> int:
                 # No backfill target beyond current_block (12_345) — main-loop entry.
                 return 0
 
@@ -578,7 +541,6 @@ class TestBotRunnerRunBlockStreamAcquiredOnce:
                 bot=bot,
                 engine_registry=registry,  # type: ignore[arg-type]
                 async_w3=_FakeAsyncW3(),
-                snapshots=(None, None, None, None),
                 path_builder=lambda **_kw: _noop_coro(),
                 consumer=recording_consumer,
                 relay_posture=RelayPosture(relay_urls=["http://offline-test.relay"]),
@@ -621,7 +583,6 @@ class TestBotRunnerShutdown:
                 bot=bot,
                 engine_registry=engine_registry,
                 async_w3=_FakeAsyncW3(),
-                snapshots=(None, None, None, None),
                 path_builder=lambda **_kw: _noop_coro(),
                 consumer=lambda **_kw: _noop_coro(),
                 relay_posture=RelayPosture(relay_urls=["http://offline-test.relay"]),
@@ -649,7 +610,6 @@ class TestBotRunnerShutdown:
                 bot=_FakeBot(),
                 engine_registry=engine_registry,
                 async_w3=_FakeAsyncW3(),
-                snapshots=(None, None, None, None),
                 path_builder=lambda **_kw: _noop_coro(),
                 consumer=lambda **_kw: _noop_coro(),
                 relay_posture=RelayPosture(relay_urls=["http://offline-test.relay"]),
@@ -678,7 +638,6 @@ class TestBotRunnerShutdown:
                 bot=_FakeBot(),
                 engine_registry=engine_registry,
                 async_w3=_FakeAsyncW3(),
-                snapshots=(None, None, None, None),
                 path_builder=lambda **_kw: _noop_coro(),
                 consumer=lambda **_kw: _noop_coro(),
                 relay_posture=RelayPosture(relay_urls=["http://offline-test.relay"]),
@@ -705,7 +664,6 @@ class TestBotRunnerShutdown:
                 bot=None,
                 engine_registry=None,
                 async_w3=None,
-                snapshots=(None, None, None, None),
                 path_builder=lambda **_kw: _noop_coro(),
                 consumer=lambda **_kw: _noop_coro(),
                 relay_posture=RelayPosture(relay_urls=["http://offline-test.relay"]),
@@ -735,7 +693,6 @@ class TestBotRunnerShutdown:
                 bot=bot,
                 engine_registry=engine_registry,
                 async_w3=_FakeAsyncW3(),
-                snapshots=(None, None, None, None),
                 path_builder=lambda **_kw: _noop_coro(),
                 consumer=hanging_consumer,
                 relay_posture=RelayPosture(relay_urls=["http://offline-test.relay"]),
@@ -781,7 +738,6 @@ class TestBotRunnerSigintHandler:
                 bot=_FakeBot(),
                 engine_registry=engine_registry,
                 async_w3=_FakeAsyncW3(),
-                snapshots=(None, None, None, None),
                 path_builder=lambda **_kw: _noop_coro(),
                 consumer=lambda **_kw: _noop_coro(),
                 relay_posture=RelayPosture(relay_urls=["http://offline-test.relay"]),
@@ -806,7 +762,6 @@ class TestBotRunnerSigintHandler:
                 bot=_FakeBot(),
                 engine_registry=engine_registry,
                 async_w3=_FakeAsyncW3(),
-                snapshots=(None, None, None, None),
                 path_builder=lambda **_kw: _noop_coro(),
                 consumer=lambda **_kw: _noop_coro(),
                 relay_posture=RelayPosture(relay_urls=["http://offline-test.relay"]),
@@ -837,7 +792,6 @@ class TestBotRunnerSigintHandler:
                 bot=_FakeBot(),
                 engine_registry=engine_registry,
                 async_w3=_FakeAsyncW3(),
-                snapshots=(None, None, None, None),
                 path_builder=lambda **_kw: _noop_coro(),
                 consumer=lambda **_kw: _noop_coro(),
                 relay_posture=RelayPosture(relay_urls=["http://offline-test.relay"]),
@@ -866,7 +820,6 @@ class TestBotRunnerSigintHandler:
                 bot=_FakeBot(),
                 engine_registry=engine_registry,
                 async_w3=_FakeAsyncW3(),
-                snapshots=(None, None, None, None),
                 path_builder=lambda **_kw: _noop_coro(),
                 consumer=lambda **_kw: _noop_coro(),
                 relay_posture=RelayPosture(relay_urls=["http://offline-test.relay"]),
@@ -920,7 +873,6 @@ class TestConstructionContext:
                 bot=_FakeBot(),
                 engine_registry=engine_registry,
                 async_w3=_FakeAsyncW3(),
-                snapshots=(None, None, None, None),
                 path_builder=recording_path_builder,
                 consumer=lambda **_kw: _noop_coro(),
                 relay_posture=RelayPosture(relay_urls=["http://offline-test.relay"]),
@@ -973,7 +925,6 @@ class TestSubBBackgroundRegistration:
                 bot=_FakeBot(),
                 engine_registry=engine_registry,
                 async_w3=_FakeAsyncW3(),
-                snapshots=(None, None, None, None),
                 path_builder=raising_path_builder,
                 consumer=hanging_consumer,
                 relay_posture=RelayPosture(relay_urls=["http://offline-test.relay"]),
@@ -1001,7 +952,6 @@ class TestSubBBackgroundRegistration:
                 bot=bot,
                 engine_registry=engine_registry,
                 async_w3=_FakeAsyncW3(),
-                snapshots=(None, None, None, None),
             ),
         )
         session.bot = bot  # start()/run() resolve these; call the seam directly
@@ -1048,7 +998,6 @@ class TestSubBBackgroundRegistration:
                 bot=bot,
                 engine_registry=_FakeEngineRegistry(),
                 async_w3=_FakeAsyncW3(),
-                snapshots=(None, None, None, None),
                 path_builder=blocking_path_builder,
                 consumer=hanging_consumer,
                 relay_posture=RelayPosture(relay_urls=["http://offline-test.relay"]),
@@ -1073,13 +1022,9 @@ class TestSubBBackgroundRegistration:
             with contextlib.suppress(asyncio.CancelledError):
                 await run_task
 
-    async def test_background_completion_closes_snapshot_tx(self) -> None:
-        """A *healthy* (non-cancelled) registration must still close the
-        snapshot read-tx after `build_paths` completes — the canary stays
-        active in the normal path (WAL reclamation preserved)."""
+    async def test_background_completion_releases_python_state(self) -> None:
         calls: list[str] = []
         bot = _FakeBot(events=calls)
-        bot._py_bot = _RecordingPyBot(calls)  # records `close_snapshot_tx`
         session = BotRunner(
             _cfg(),
             actors=InjectedActors(
@@ -1087,7 +1032,6 @@ class TestSubBBackgroundRegistration:
                 bot=bot,
                 engine_registry=_FakeEngineRegistry(),
                 async_w3=_FakeAsyncW3(),
-                snapshots=(None, None, None, None),
             ),
         )
         session.bot = bot
@@ -1104,27 +1048,13 @@ class TestSubBBackgroundRegistration:
             retry_policy=None,
         )
 
-        # The successful run commits the read tx (canary fires) + releases the bot.
-        assert calls.count("close_snapshot_tx") == 1
+        assert calls.count("release") == 1
         assert bot.released is True
         assert session.bot is None
 
-    async def test_background_cancel_skips_close_snapshot_tx(self) -> None:
-        """A mid-registration cancel must NOT close the snapshot read-tx.
-
-        Registration offloads `assemble_*_tick_map` (which clone the
-        `Arc<SnapshotDb>`) onto a ThreadPoolExecutor; on cancel those worker
-        threads may still hold their clones, so `close_snapshot_tx`'s
-        `Arc::try_unwrap` canary false-positives and would raise
-        ``RuntimeError: SnapshotDb Arc still held`` during teardown.
-        The cancel branch must instead drop the Arc naturally and stay quiet —
-        the teardown stays clean and CancelledError propagates unadorned.
-        """
+    async def test_background_cancel_releases_state_and_propagates_cancellation(self) -> None:
         calls: list[str] = []
         bot = _FakeBot(events=calls)
-        # Simulate the in-flight-worker-clone scenario: the held `_py_bot`
-        # would trip the canary if `close_snapshot_tx` were invoked mid-cancel.
-        bot._py_bot = _RecordingPyBot(calls, raise_on_close=True)
         session = BotRunner(
             _cfg(),
             actors=InjectedActors(
@@ -1132,7 +1062,6 @@ class TestSubBBackgroundRegistration:
                 bot=bot,
                 engine_registry=_FakeEngineRegistry(),
                 async_w3=_FakeAsyncW3(),
-                snapshots=(None, None, None, None),
             ),
         )
         session.bot = bot
@@ -1153,15 +1082,11 @@ class TestSubBBackgroundRegistration:
         )
         await asyncio.wait_for(builder_started.wait(), timeout=1)
         task.cancel()
-        # The cancelled task re-raises CancelledError cleanly — the secondary
-        # `close_snapshot_tx` RuntimeError must NOT surface in its place.
         with pytest.raises(asyncio.CancelledError):
             await task
 
-        # The read-tx canary was deliberately skipped for the teardown path.
-        assert "close_snapshot_tx" not in calls, (
-            "close_snapshot_tx must not run on the mid-registration cancel path"
-        )
+        assert bot.released is True
+        assert session.bot is None
 
 
 class TestSubCBgRegistrationConcurrency:
@@ -1208,7 +1133,6 @@ class TestSubCBgRegistrationConcurrency:
                 bot=_FakeBot(),
                 engine_registry=engine_registry,
                 async_w3=_FakeAsyncW3(),
-                snapshots=(None, None, None, None),
                 path_builder=forever_path_builder,
                 consumer=consumer,
                 relay_posture=RelayPosture(relay_urls=["http://offline-test.relay"]),
@@ -1258,7 +1182,6 @@ class TestSubCBgRegistrationConcurrency:
                 bot=_FakeBot(),
                 engine_registry=engine_registry,
                 async_w3=_FakeAsyncW3(),
-                snapshots=(None, None, None, None),
                 path_builder=draining_path_builder,
                 consumer=consumer,
                 relay_posture=RelayPosture(relay_urls=["http://offline-test.relay"]),
@@ -1299,7 +1222,6 @@ class TestSubCBgRegistrationConcurrency:
                 bot=_FakeBot(),
                 engine_registry=engine_registry,
                 async_w3=_FakeAsyncW3(),
-                snapshots=(None, None, None, None),
                 path_builder=raising_path_builder,
                 consumer=hanging_consumer,
                 relay_posture=RelayPosture(relay_urls=["http://offline-test.relay"]),
@@ -1358,7 +1280,6 @@ class TestSubCBgRegistrationConcurrency:
                 bot=bot,
                 engine_registry=registry,  # type: ignore[arg-type]
                 async_w3=_FakeAsyncW3(),
-                snapshots=(None, None, None, None),
                 path_builder=forever_path_builder,
                 consumer=recording_consumer,
                 relay_posture=RelayPosture(relay_urls=["http://offline-test.relay"]),
@@ -1401,7 +1322,6 @@ def started_session():
                     engine_registry if engine_registry is not None else _FakeEngineRegistry()
                 ),
                 async_w3=_FakeAsyncW3(),
-                snapshots=(None, None, None, None),
                 path_builder=path_builder,
                 consumer=consumer,
                 relay_posture=RelayPosture(relay_urls=["http://offline-test.relay"]),
@@ -1793,7 +1713,6 @@ class TestSessionOperatorSurface:
                 bot=_FakeBot(),
                 engine_registry=engine_registry,
                 async_w3=_FakeAsyncW3(),
-                snapshots=(None, None, None, None),
                 path_builder=lambda **_kw: _noop_coro(),
                 consumer=lambda **_kw: _noop_coro(),
                 relay_posture=RelayPosture(relay_urls=["http://offline-test.relay"]),
@@ -1850,7 +1769,6 @@ class TestSessionOperatorSurface:
                 bot=_FakeBot(),
                 engine_registry=engine_registry,
                 async_w3=_FakeAsyncW3(),
-                snapshots=(None, None, None, None),
                 path_builder=lambda **_kw: _noop_coro(),
                 consumer=consumer,
                 relay_posture=RelayPosture(relay_urls=["http://offline-test.relay"]),
@@ -1916,7 +1834,6 @@ class TestPumpFinishedWatchdog:
                 bot=_FakeBot(),
                 engine_registry=engine_registry,
                 async_w3=_FakeAsyncW3(),
-                snapshots=(None, None, None, None),
                 path_builder=lambda **_kw: _noop_coro(),
                 consumer=hanging_consumer,
                 relay_posture=RelayPosture(relay_urls=["http://offline-test.relay"]),
@@ -1975,7 +1892,6 @@ class TestPumpFinishedWatchdog:
                 bot=_FakeBot(),
                 engine_registry=engine_registry,
                 async_w3=_FakeAsyncW3(),
-                snapshots=(None, None, None, None),
                 path_builder=lambda **_kw: _noop_coro(),
                 consumer=hanging_consumer,
                 relay_posture=RelayPosture(relay_urls=["http://offline-test.relay"]),
@@ -2006,7 +1922,6 @@ class TestPumpFinishedWatchdog:
                 bot=_FakeBot(),
                 engine_registry=_FakeEngineRegistry(engine=fake_engine),
                 async_w3=_FakeAsyncW3(),
-                snapshots=(None, None, None, None),
                 path_builder=lambda **_kw: _noop_coro(),
                 consumer=hanging_consumer,
                 relay_posture=RelayPosture(relay_urls=["http://offline-test.relay"]),
@@ -2030,9 +1945,7 @@ class TestPumpFinishedWatchdog:
 
                 # Deadlock guard only — not an ordering assertion.
                 done, _pending = await asyncio.wait({watchdog}, timeout=5.0)
-                assert watchdog in done, (
-                    "the watchdog must resolve when the pump-finish gate opens"
-                )
+                assert watchdog in done, "the watchdog must resolve when the pump-finish gate opens"
             finally:
                 watchdog.cancel()
                 with contextlib.suppress(asyncio.CancelledError):

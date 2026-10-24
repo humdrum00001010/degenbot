@@ -26,17 +26,6 @@
 //! *implementations* (and the `PyTickWordFetcher` `PyO3` adapter) live in
 //! `degenbot-bot` / `degenbot-python`.
 //!
-//! ## Relationship to `super::bootstrap::TickBootstrapRpc`
-//!
-//! The bootstrap trait (sibling module) serves the **registration-time** Chain
-//! arm of `assemble_*_tick_map` — keyed by *address* (the pool's contract
-//! address is known BEFORE `register_*_pool` assigns the internal `pool_id`).
-//! This miss-path trait serves the **live-pump miss-detection path** during
-//! swap simulation — keyed by *`pool_id`* (already-registered pools). The two
-//! traits share the same choreography (compute word → fetch bitmap → enumerate
-//! bits → fetch ticks) but differ in key type and call site. Keep two
-//! traits for now; consolidation is a follow-up.
-
 use hashbrown::HashMap;
 
 use crate::TickInfo;

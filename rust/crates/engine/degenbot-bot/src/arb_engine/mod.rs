@@ -184,7 +184,7 @@ pub use retune::EngineRetune;
 /// `PumpPhase::after_subscribe(current, core_has_snapshot)` to reflect
 /// reality — landing at `SnapshotLoaded` (not `Subscribed`) so `resume()`
 /// (which requires `>= SnapshotLoaded`) is reachable:
-/// Created ──load_snapshot_from_db()──[core has snapshot]──► subscribe()
+/// Created ──register complete pool snapshot──[core has snapshot]──► subscribe()
 ///        ──► SnapshotLoaded ──resume()──► Resumed
 /// ```
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]

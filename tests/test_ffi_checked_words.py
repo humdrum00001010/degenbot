@@ -38,7 +38,8 @@ def _register_sparse_v3(bot: Bot, *, tick_data_fetcher=None) -> int:
 def _snapshot(pool: object) -> dict[int, tuple[int, int]]:
     """Normalize a `tick_bitmap_snapshot()` dict to plain python ints."""
     return {
-        int(word): (int(row[0]), int(row[1])) for word, row in pool.concentrated_liquidity().tick_bitmap.items()
+        int(word): (int(row[0]), int(row[1]))
+        for word, row in pool.concentrated_liquidity().tick_bitmap.items()
     }
 
 
@@ -151,87 +152,6 @@ def test_v4_sparse_checked_zero_word_survives_in_snapshot() -> None:
 # rejected AT INTAKE with a ValueError that names the conflict — never
 # registered as Tracked (Q3': Tracked pools carry no bitmap in memory, so
 # there is no later cross-check; intake is the only gate).
-
-
-def test_assemble_v3_inconsistent_tracked_snapshot_rejected_at_intake(tmp_path):
-    import sqlite3
-
-    import pytest
-
-    from degenbot._ffi import Bot
-    from degenbot._ffi.db import db_upgrade_database
-
-    pool_addr = "0x2222222222222222222222222222222222222222"
-    db_path = str(tmp_path / "inconsistent.sqlite")
-    db_upgrade_database(db_path)
-    conn = sqlite3.connect(db_path)
-    try:
-        conn.execute(
-            "INSERT INTO erc20_tokens (id, chain, address, name, symbol, decimals) "
-            "VALUES (1, 1, ?, NULL, NULL, NULL), (2, 1, ?, NULL, NULL, NULL)",
-            [
-                "0xA0b86991c6218b36c1D19D4a2e9Eb0cE3606eB48",
-                "0xC02aaA39b223FE8D0A0e5C4f27eAD9083C756Cc2",
-            ],
-        )
-        conn.execute(
-            "INSERT INTO exchanges (id, chain_id, name, active, last_update_block, factory, deployer) "
-            "VALUES (1, 1, 'uniswap_v3', 1, NULL, ?, NULL)",
-            ["0x1F98431c8aD98523631AE4a59f267346ea31F984"],
-        )
-        conn.execute(
-            "INSERT INTO pools (id, address, chain, kind, token0_id, token1_id, exchange_id) "
-            "VALUES (1, ?, 1, 'uniswap_v3', 1, 2, 1)",
-            [pool_addr],
-        )
-        conn.execute(
-            "INSERT INTO uniswap_v3_pools "
-            "(pool_id, tick_spacing, liquidity_update_block, liquidity_update_log_index, fee_token0, fee_token1, fee_denominator) "
-            "VALUES (1, 10, NULL, NULL, 0, 0, 1)",
-        )
-        # The row is at tick 20 (compressed position 2 at spacing 10) but the
-        # bitmap word 0 has bit 1 set (tick 10) — the two contradict.
-        conn.execute(
-            "INSERT INTO liquidity_positions "
-            "(id, pool_id, tick, liquidity_net, liquidity_gross) "
-            "VALUES (1, 1, 20, '100', '100')",
-        )
-        conn.execute(
-            "INSERT INTO initialization_maps (id, pool_id, word, bitmap) VALUES (1, 1, 0, '2')",
-        )
-        conn.commit()
-    finally:
-        conn.close()
-
-    bot = Bot(1)
-    bot.load_snapshot_from_db(db_path, 1)
-
-    with pytest.raises(ValueError, match=r"Tracked tick map inconsistent at intake") as excinfo:
-        bot.assemble_v3_tick_map(pool_addr, tick_spacing=10)
-    message = str(excinfo.value)
-    # The error must name the conflicting position and show both sides of
-    # the contradiction (the side reported may vary by HashMap order).
-    assert "word 0" in message
-    assert "(tick 10)" in message or "(tick 20)" in message
-    assert "bitmap_bit" in message
-    assert "row_gross_positive" in message
-
-    # A consistent snapshot (bit 2 ↔ row tick 20) is accepted as Tracked.
-    # Fresh Bot: the first bot's held read transaction predates the UPDATE
-    # (WAL snapshot isolation) and would keep seeing the old bitmap.
-    conn = sqlite3.connect(db_path)
-    try:
-        conn.execute("UPDATE initialization_maps SET bitmap = '4' WHERE id = 1")
-        conn.commit()
-    finally:
-        conn.close()
-    bot2 = Bot(1)
-    bot2.load_snapshot_from_db(db_path, 1)
-    result = bot2.assemble_v3_tick_map(pool_addr, tick_spacing=10)
-    assert result is not None
-    tick_data, coverage = result
-    assert coverage == "tracked"
-    assert set(tick_data) == {20}
 
 
 if __name__ == "__main__":

@@ -357,7 +357,7 @@ class ArbitrageEngine:
         driver so a self-halt is queryable. A facet name the host does not
         admit fails the call before the pump resumes.
         """
-    def run_v3_registration_lifecycle(self, /, address: str, snapshot_block: int | None) -> Any:
+    def run_v3_registration_lifecycle(self, /, address: str) -> Any:
         """
         Run a single V3 pool's registration verify-lifecycle end-to-end
         (ADR-022 D1) — the core-owned
@@ -367,9 +367,7 @@ class ArbitrageEngine:
         mismatch tripwire before `Live`. Uses the bot's single verify provider
         (D-B).
         """
-    def run_v3_registration_lifecycle_sync(
-        self, /, address: str, snapshot_block: int | None
-    ) -> None:
+    def run_v3_registration_lifecycle_sync(self, /, address: str) -> None:
         """
         Blocking (seat-thread) twin of `run_v3_registration_lifecycle` — the
         PRG-5 registration-intake units run on fleet `PoolStateUpdater` seats
@@ -379,7 +377,7 @@ class ArbitrageEngine:
         only the park shape differs.
         """
     def run_v3_registration_lifecycle_with_retry_sync(
-        self, /, address: str, snapshot_block: int | None, policy: RetryPolicy
+        self, /, address: str, policy: RetryPolicy
     ) -> None:
         """
         Blocking V3 verify-lifecycle under the core-owned bounded retry dance.
@@ -389,27 +387,20 @@ class ArbitrageEngine:
         A transient failure releases the lifecycle claim, so a retry re-runs the
         whole choreography.
         """
-    def run_v4_registration_lifecycle(
-        self, /, pool_manager_address: str, pool_id_hex: str, snapshot_block: int | None
-    ) -> Any:
+    def run_v4_registration_lifecycle(self, /, pool_manager_address: str, pool_id_hex: str) -> Any:
         """
         V4 twin of `run_v3_registration_lifecycle`, keyed by
         (`pool_manager_address`, `pool_id_hex`). A tracked V4 pool with no
         `verify_state_view` configured fails fast (`PyValueError`, D-C).
         """
     def run_v4_registration_lifecycle_sync(
-        self, /, pool_manager_address: str, pool_id_hex: str, snapshot_block: int | None
+        self, /, pool_manager_address: str, pool_id_hex: str
     ) -> None:
         """
         Blocking (seat-thread) V4 twin of `run_v3_registration_lifecycle_sync`.
         """
     def run_v4_registration_lifecycle_with_retry_sync(
-        self,
-        /,
-        pool_manager_address: str,
-        pool_id_hex: str,
-        snapshot_block: int | None,
-        policy: RetryPolicy,
+        self, /, pool_manager_address: str, pool_id_hex: str, policy: RetryPolicy
     ) -> None:
         """
         Blocking V4 verify-lifecycle under the core-owned bounded retry dance.
@@ -519,30 +510,15 @@ class ArbitrageEngine:
     @property
     def snapshot_seed_block(self, /) -> int | None:
         """
-        The snapshot seed block `S` — set at `Bot.__init__` time by
-        `Bot::load_snapshot_from_db` for the DB path, OR via
-        [`set_snapshot_seed_block`](Self::set_snapshot_seed_block) for the
-        non-DB (file/memory) path (the pyo3 `backfill_from_snapshot`
-        is retired; the core auto-backfill inside `BlockPump::resume_from_subscribe`
-        reads `S` from the shared `BotState`). `None` = cold-start (no snapshot
-        loaded).
+        Earliest registered complete pool snapshot, widened by an explicit
+        manual replay boundary. The pump replays through the WebSocket anchor.
         """
     @snapshot_seed_block.setter
     def snapshot_seed_block(self, /, block: int | None) -> None:
         """
-        Set the snapshot seed block `S` on the shared `BotState` for the
-        non-DB (file/memory) snapshot path.
-
-        The DB path (`Bot::load_snapshot_from_db`) sets `S` itself; the
-        non-DB path calls this once after `load_v3_snapshot_from_py` /
-        `load_v4_snapshot_from_py` so the shared `BotState` carries `S =
-        min(newest_block_v3, newest_block_v4)` — the seed the core
-        auto-backfill closes the snapshot→WS gap from.
-
-        `None` clears the seed (cold-start resume); `Some(b)` overrides the
-        stored seed (used only when no snapshot has set it yet — the DB path's
-        already-set seed takes precedence on the production path because the
-        non-DB path does not call this setter).
+        Set a replay boundary for manually supplied state. It can widen the
+        startup gap but cannot advance past or clear registered pool snapshots.
+        None clears only this manual boundary.
         """
     def solve_all_paths(self, /, block_number: int) -> None:
         """
@@ -690,63 +666,6 @@ class Bot:
     state — the Polars three-layer invariant, preserved + generalized by D4).
     """
     def __new__(cls, /, chain_id: int = 0) -> Bot: ...
-    def assemble_v3_tick_map(
-        self,
-        /,
-        address: str,
-        tick: int = 0,
-        tick_spacing: int = 0,
-        block: int = 0,
-        io: BotIo | None = None,
-    ) -> tuple[dict, str] | None:
-        """
-        Assemble a V3 pool's tick map from the stored DB snapshot (`Store → Db`
-        precedence — Decision 6 (B)). Returns
-        `(tick_data, coverage)` on a hit, `None` on a miss (caller runs Branch 3
-        sparse RPC and registers inline). Raises `RuntimeError` on a Db read
-        failure — Decision 8 (A): loud error over silent degrade.
-
-        `tick_data` has the same `{tick: (liquidity_gross, liquidity_net, block)}`
-        shape as `register_v3_pool`'s `tick_data` arg, so the builder can pass
-        the returned dict straight back into `register_v3_pool`. Coverage is
-        `"tracked"` on a hit (Store or Db).
-
-        **Two-phase lock protocol**: `BotState`'s read guard is held only for
-        the `SnapshotStore::take` (brief `Mutex` lock); the Db read inside the
-        core helper runs with NO `BotState` lock held (the live pump's
-        `state.write()` is not blocked). The GIL is released across the Db read.
-
-        Args:
-          address: the V3 pool's contract address (checksummed or lowercase hex).
-          tick: the pool's current tick (drives the Chain arm's word computation).
-          `tick_spacing`: the pool's tick spacing (drives active-tick computation).
-          block: the snapshot block for the Chain arm's RPC reads.
-          io: optional `PyBotIo` whose native alloy provider backs the Chain arm.
-            `None` (or a non-alloy provider) → no Chain arm (Store + Db only).
-        """
-    def assemble_v4_tick_map(
-        self,
-        /,
-        pool_manager: str,
-        pool_id: Any,
-        state_view: str,
-        tick: int = 0,
-        tick_spacing: int = 0,
-        block: int = 0,
-        io: BotIo | None = None,
-    ) -> tuple[dict, str] | None:
-        """
-        Assemble a V4 pool's tick map from the stored DB snapshot — V4 twin of
-        [`Self::assemble_v3_tick_map`]. Same precedence, miss, and error
-        semantics; returns `(tick_data, coverage)` on a hit, `None` on miss,
-        `RuntimeError` on Db error.
-
-        Args:
-          `pool_manager`: the V4 `PoolManager` contract address (Db key).
-          `pool_id`: the V4 pool id as a 32-byte hex `str` (`0x...`) or `bytes`.
-          `state_view`: the V4 `StateView` contract address (Chain-arm RPC target).
-          `tick`/`tick_spacing`/`block`/`io`: see [`Self::assemble_v3_tick_map`].
-        """
     def attach_construction_io(self, /, provider: Any, database_path: str | None = None) -> None:
         """
         Attach a construction-I/O handle built from a Python provider + an
@@ -889,17 +808,13 @@ class Bot:
         /,
         address: str,
         block: int | None = None,
-        db: bool = True,
-        tick_data_fetcher: Any | None = None,
         slot_layout: str | None = None,
         factories: Sequence[str] | None = None,
     ) -> tuple[int, str, str, str, str]:
         """
         Build + register a V3 pool through the Rust `PoolBuilder` (
         delegation adapter) — the V3 twin of [`Self::build_v2_pool`]. The tick
-        map is assembled DB-first (a `TickMapDb` hit → `Tracked`, feeding the
-        quarantine→verify lifecycle; `db=false` forces the Chain-arm
-        Sparse path). `block` defaults to the current chain head.
+        map is a complete block-pinned Erigon snapshot. `block` defaults to the chain head.
 
         # Errors
 
@@ -917,8 +832,6 @@ class Bot:
         hook_address: str | None,
         state_view_address: str,
         block: int | None = None,
-        db: bool = True,
-        tick_data_fetcher: Any | None = None,
     ) -> tuple[int, str, str, str, str, int, int, int, str, int, int]: ...
     def calculate_tokens_in(self, /, pool_id: int, zero_for_one: bool, amount_out: Any) -> Any:
         """
@@ -947,18 +860,6 @@ class Bot:
         The chain this `PyBot` orchestrates (ADR-006 D4). Wired from the
         single-chain Python `Bot` facade's ``config.default_chain_id``; `0` on
         the bare-test-fixture path (see `PyBot::new`).
-        """
-    def close_snapshot_tx(self, /) -> None:
-        """
-        Commit + drop the held snapshot read transaction.
-        Call after `build_paths` finishes so the WAL snapshot is released + the
-        updater's checkpoint can reclaim `-wal` space. After this, `db_handle()`
-        returns `None` (the `assemble_*` Db arm goes through the held tx — once
-        it's closed, there's no Db arm for late registrations; they'd need a
-        fresh handle). Idempotent on a not-loaded bot (no-op).
-
-        # Errors
-        `PyRuntimeError` if the `COMMIT` fails.
         """
     def curve_get_dy(
         self,
@@ -1057,29 +958,6 @@ class Bot:
 
         Returns:
             A `PyErc20Token` handle, or `None` if the address is not registered.
-        """
-    def load_snapshot_from_db(self, /, db_path: str, chain_id: int) -> None:
-        """
-        Load the V3 + V4 DB snapshot into the core `BotState` .
-
-        Called at Python `Bot.__init__` time when a DB path is configured
-        (Shape 2: eager construction-time load). Opens a read-only
-        `DegenbotDb` handle from `db_path`, then calls the core
-        `Bot::load_snapshot_from_db` — the single Rust entry point that
-        `stream_liquidity_maps`-loads V3+V4 pools into the core `SnapshotStore`s
-        + records `S = min(fetch_newest_update_block(V3), V4)`. After this,
-        pool registration consumes the store via `take()` — the
-        Python builder passes `tick_data=None, coverage=Tracked` and lets the
-        store decide Tracked-vs-Sparse per pool.
-
-        `None`/cold-start (no pools) is NOT an error — the pump anchors on
-        `first_observed_block` at resume. Idempotent across the two families,
-        but a second call after a successful load will `begin_load` a store
-        that's already loaded (panics) — call exactly once at construction.
-
-        # Errors
-        `PyRuntimeError` on a DB open/read failure or a liquidity value
-        out of range.
         """
     def pool_count(self, /) -> int:
         """
@@ -1333,8 +1211,8 @@ class Bot:
 
         `tick_data` is ``{tick: (liquidity_gross, liquidity_net, block)}``
         (symmetric with ``PyLiquidityPool.tick_data_snapshot``).
-        `coverage` is ``"tracked"`` (complete DB snapshot) or ``"sparse"``
-        (RPC-fetched active word only / no snapshot).
+        `coverage` declares whether the injected map is complete (``"tracked"``)
+        or partial (``"sparse"``).
         """
     def register_v4_pool(
         self,
@@ -1449,9 +1327,7 @@ class Bot:
 
         V4 identity is **caller-supplied** (mirrors `register_v4_pool`: the
         core never reads `getToken0`/`getHooks` on-chain). The builder fetches
-        only the LIVE scalars (`getSlot0` + `getLiquidity` on `state_view`)
-        and assembles/seeds a Sparse tick map via the Chain arm — reusing the
-        StateView-backed choreography with no new ABI.
+        the complete tick map and live scalars from one block-pinned Erigon snapshot.
 
         The caller must register the V4 `state_view` mapping for
         `pool_manager` (done here, idempotent) before this returns, so the
@@ -1472,7 +1348,7 @@ class Bot:
         `backfill_from_snapshot` method is retired. Delegates to the
         shared `PumpState`.
         """
-    def run_v3_registration_lifecycle(self, /, address: str, snapshot_block: int | None) -> Any:
+    def run_v3_registration_lifecycle(self, /, address: str) -> Any:
         """
         Run a single V3 pool's registration verify-lifecycle end-to-end
         (ADR-022 D1): the core-owned `quarantine → seed-verify → drain+pin →
@@ -1481,9 +1357,7 @@ class Bot:
         RPC); **Tracked** → verified with the mismatch tripwire before `Live`.
         Uses the bot's single verify provider + stored verify config (D-B/D-C).
         """
-    def run_v4_registration_lifecycle(
-        self, /, pool_manager_address: str, pool_id_hex: str, snapshot_block: int | None
-    ) -> Any:
+    def run_v4_registration_lifecycle(self, /, pool_manager_address: str, pool_id_hex: str) -> Any:
         """
         V4 twin of `run_v3_registration_lifecycle`, keyed by
         (`pool_manager_address`, `pool_id_hex`). A tracked V4 pool with no
@@ -1506,9 +1380,7 @@ class Bot:
     @property
     def snapshot_seed_block(self, /) -> int | None:
         """
-        The snapshot seed block `S` (or `None` when no DB snapshot was loaded —
-        the cold-start path). Python reads this in `engine_registry.start()`
-        to stash `_verify_snapshot_block` for the per-pool two-step verify.
+        The earliest complete pool snapshot horizon available for pump replay.
         """
     def stop(self, /) -> None:
         """
@@ -1842,36 +1714,6 @@ class BotIo:
         `None` when the row is absent or no `database_path` is configured (mirrors
         the prior `contextlib.suppress(Exception)` skip).
         """
-    def fetch_tick_bitmap(
-        self, /, pool_address: str, word_position: int, block: Any | None = None
-    ) -> Any:
-        """
-        Fetch a V3 pool's tick bitmap word via `tickBitmap(int16)`, performing
-        the encode -> call -> decode choreography in Rust (ADR-005 slice 14j).
-
-        Calldata + return decode from `degenbot_rpc::abi` (B2) — no hand-rolled
-        `selector` / `sign_extend_to_32_bytes` here. The encode/decode helpers
-        are shared with `AlloyTickBootstrapRpc` (the standalone-Rust `cargo add
-        degenbot` consumer path), so the choreography stays byte-identical
-        across the pyo3 adapter and the alloy impl ).
-
-        Errors propagate: provider revert surfaces as `PyErr` (the Python
-        caller's `except Exception: return` handles it).
-        """
-    def fetch_tick_data(
-        self, /, pool_address: str, tick: int, block: Any | None = None
-    ) -> tuple[Any, Any]:
-        """
-        Fetch a V3 pool's tick liquidity data via `ticks(int24)`, performing
-        the encode -> call -> decode choreography in Rust (ADR-005 slice 14j).
-
-        Calldata + return decode from `degenbot_rpc::abi` (B2). The result's
-        first two fields (`liquidity_gross: uint128`, `liquidity_net: int128`)
-        are right-aligned in their 32-byte ABI words; `decode_tick_data` reads
-        those 64 bytes directly.
-
-        Errors propagate (see [`Self::fetch_tick_bitmap`]).
-        """
     def fetch_token_allowance(
         self, /, token: str, owner: str, spender: str, block: Any | None = None
     ) -> Any:
@@ -1954,36 +1796,6 @@ class BotIo:
            interpretation to Python's `decode_slot0` callers.
 
         Returns a 5-tuple `(sqrtPriceX96, tick, protocolFee, lpFee, liquidity)`.
-
-        Errors propagate.
-        """
-    def fetch_v4_tick_bitmap(
-        self,
-        /,
-        state_view_address: str,
-        pool_id: bytes,
-        word_position: int,
-        block: Any | None = None,
-    ) -> Any:
-        """
-        Fetch a V4 pool's tick bitmap via `getTickBitmap(bytes32,int16)` on the
-        state-view contract (ADR-005 slice 14k).
-
-        Calldata + return decode from `degenbot_rpc::abi` (B2). V4 adds a
-        `pool_id` (`bytes32`) prefix argument before the `int16` word position.
-
-        Errors propagate.
-        """
-    def fetch_v4_tick_data(
-        self, /, state_view_address: str, pool_id: bytes, tick: int, block: Any | None = None
-    ) -> tuple[Any, Any]:
-        """
-        Fetch a V4 pool's tick liquidity via `getTickLiquidity(bytes32,int24)`
-        on the state-view contract (ADR-005 slice 14k).
-
-        Calldata + return decode from `degenbot_rpc::abi` (B2). V4 adds a
-        `pool_id` (`bytes32`) prefix argument before the `int24` tick. The V4
-        tick return is just `(uint128, int128)` — exactly 2 fields.
 
         Errors propagate.
         """
@@ -2262,8 +2074,6 @@ class _ConfigNodesFace:
 class _ConfigOfflineFace:
     @property
     def clcap_block(self) -> int | None: ...
-    @property
-    def clcap_max_fetches(self) -> int: ...
     @property
     def clcap_path_cap(self) -> int: ...
     @property

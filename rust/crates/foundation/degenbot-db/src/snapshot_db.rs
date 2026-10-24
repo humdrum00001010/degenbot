@@ -170,7 +170,7 @@ impl SnapshotDb {
     /// # Panics
     /// Panics if a `last_update_block` is negative — invalid DB state (`SQLite`
     /// stores block numbers as signed `i64`, but on-chain block numbers are
-    /// non-negative). Mirrors `Bot::load_snapshot_from_db`'s contract.
+    /// non-negative).
     pub fn close_with_canary(
         self,
         s_snapshot: Option<u64>,

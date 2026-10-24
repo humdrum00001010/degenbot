@@ -3,8 +3,8 @@
 //!
 //! The recorder wraps the live endpoint in the recording transport
 //! (`degenbot-rpc`'s `cassette` module) and drives the updaters' real fetch
-//! surface — one pool-updater chunk (the `PoolCreated` fetch plus the
-//! whole-chain V3 liquidity scan) or one Aave market chunk — plus the
+//! surface — one catalog chunk of `PoolCreated`/`Initialize` events or
+//! one Aave market chunk — plus the
 //! ancillary `eth_chainId`/`eth_blockNumber` round trips. The
 //! cassette is flushed with the recorder's canonical writer; the same writer
 //! is what the drift gate (`--check`, and the `degenbot-rpc` corpus test)
@@ -27,14 +27,7 @@
 //!     ... --kind aave --pool 0x87870Bca3F3fD6335C3F4ce8392D69350B4fA4E2 \
 //!         --from 26130440 --to 26130445 --out tests/fixtures/cassettes/…
 //!
-//! Two extended capture modes (the replay-suite chunk):
-//!
-//! - `--kind pool … --verify` records the verification surface: instead of the
-//!   bare fetch passes, the REAL `run_pool_update` chunk loop runs with the
-//!   pre-commit verification gate ON (`verify_chunk = true`) over a freshly
-//!   seeded temp DB, and the cassette captures everything the run asks — the
-//!   fetch surface PLUS the gate's Multicall3 aggregate3 tick/bitmap reads at
-//!   the chunk end. Those gate entries are what the negative probes mutate.
+//! Full Aave chunk-loop capture:
 //!
 //! - `--kind aave-run` records the full Aave chunk loop: the market is seeded
 //!   via the real `activate_aave_market` plus the loop's warm-boot substrate
@@ -58,10 +51,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use degenbot::aave::updater::aave_fetch::fetch_pool_logs;
 use degenbot::aave::updater::{activate_aave_market, run_aave_update};
 use degenbot::db::DegenbotDb;
-use degenbot::pool_updater::fetch::{
-    fetch_pool_created_logs, fetch_v3_liquidity_logs_grouped, PoolFamily,
-};
-use degenbot::pool_updater::{run_pool_update, NoProgress as PoolNoProgress};
+use degenbot::pool_updater::fetch::{fetch_pool_created_logs, PoolFamily};
 use degenbot::rpc::cassette::{
     rfc3339_utc, verify_cassette_bytes, CassetteProvenance, CassetteSpan, RecordingTransport,
 };
@@ -82,7 +72,6 @@ struct RecordArgs {
     pool_raw: String,
     address_provider_raw: String,
     gho_raw: String,
-    verify: bool,
     from_block: Option<u64>,
     to_block: Option<u64>,
     out: Option<PathBuf>,
@@ -101,10 +90,6 @@ enum Kind {
     Pool {
         factory: alloy::primitives::Address,
         family: PoolFamily,
-        /// `--verify`: record the verification surface — the REAL
-        /// `run_pool_update` chunk loop with the pre-commit gate ON over a
-        /// seeded temp DB (the negative-probe corpus).
-        verify: bool,
     },
     Aave {
         pool: alloy::primitives::Address,
@@ -169,7 +154,6 @@ fn parse_args() -> Result<Either, String> {
             "--to" => args.to_block = Some(parse_block("--to", &value("--to")?)?),
             "--out" => args.out = Some(PathBuf::from(value("--out")?)),
             "--node" => args.node = Some(value("--node")?),
-            "--verify" => args.verify = true,
             "--address-provider" => {
                 args.address_provider_raw = value("--address-provider")?;
             }
@@ -201,7 +185,6 @@ fn parse_args() -> Result<Either, String> {
         "pool" => Kind::Pool {
             factory: parse_addr("--factory", &args.factory_raw)?,
             family: parse_family(&args.family_raw)?,
-            verify: args.verify,
         },
         "aave" => Kind::Aave {
             pool: parse_addr("--pool", &args.pool_raw)?,
@@ -274,64 +257,6 @@ async fn probe_source(node_uri: &str) -> String {
             .unwrap_or_else(|| "unknown".to_string()),
         Err(_) => "unknown".to_string(),
     }
-}
-
-/// Seed the pool-update harness DB the replay suites use: one ACTIVE
-/// `uniswap_v3` exchange stamped at `from - 1`, so the run's fetch window is
-/// exactly the pinned span. Mirrors the `degenbot-pool-updater` replay
-/// suites' `seeded_db` (same rows, same stamp).
-fn seed_pool_update_db(
-    database_path: &Path,
-    chain_id: i64,
-    factory: alloy::primitives::Address,
-    from_block: u64,
-) -> Result<(), String> {
-    let (db, _state) =
-        DegenbotDb::open_for_writes(database_path).map_err(|e| format!("db open: {e}"))?;
-    let exchange = db
-        .upsert_exchange(chain_id, "uniswap_v3", factory, None)
-        .map_err(|e| format!("upsert_exchange: {e}"))?;
-    let stamp = from_block
-        .checked_sub(1)
-        .and_then(|b| i64::try_from(b).ok())
-        .ok_or("--from must be >= 1 for the pool-verify capture")?;
-    let conn = rusqlite::Connection::open(database_path).map_err(|e| format!("db open: {e}"))?;
-    conn.execute(
-        "UPDATE exchanges SET active = 1, last_update_block = ?1 WHERE id = ?2",
-        rusqlite::params![stamp, exchange.id],
-    )
-    .map_err(|e| format!("exchange stamp: {e}"))?;
-    Ok(())
-}
-
-/// `run_pool_update` on a plain OS thread - the run entry blocks on the
-/// shared runtime and MUST NOT run inside any tokio context (this example's
-/// `#[tokio::main]` is one), so the blocking call hops to a bare thread.
-fn run_pool_update_off_runtime(
-    database_path: PathBuf,
-    chain_id: i64,
-    to_block: u64,
-    chunk_size: u64,
-    provider: AlloyProvider,
-    verify_chunk: bool,
-) -> Result<degenbot::pool_updater::UpdateReport, String> {
-    std::thread::spawn(move || {
-        run_pool_update(
-            &database_path,
-            chain_id,
-            Some(to_block),
-            chunk_size,
-            provider,
-            Arc::new(AtomicBool::new(false)),
-            Arc::new(PoolNoProgress),
-            verify_chunk,
-            None,
-            false,
-        )
-    })
-    .join()
-    .map_err(|_| "run_pool_update worker thread panicked".to_string())?
-    .map_err(|e| format!("run_pool_update: {e}"))
 }
 
 /// The Aave warm-boot substrate the chunk loop's seeded DB carries: the
@@ -724,63 +649,13 @@ async fn record(args: RecordSpec) -> Result<usize, String> {
             args.to_block
         ));
     }
-    let chain_id_i64 = i64::try_from(chain_id).map_err(|e| format!("chain id {chain_id}: {e}"))?;
-
     let fetcher = LogFetcher::new(Arc::new(provider), 2000);
     let decoded = match &args.kind {
-        Kind::Pool {
-            factory,
-            family,
-            verify: false,
-        } => {
-            let events = fetch_pool_created_logs(
-                &fetcher,
-                args.from_block,
-                args.to_block,
-                *factory,
-                *family,
-            )
-            .await
-            .map_err(|e| format!("fetch_pool_created_logs: {e}"))?;
-            // The chunk loop's OTHER fetch surface: the whole-chain V3
-            // Mint/Burn liquidity scan over the same span (run_pool_update
-            // issues it unconditionally per chunk). Recording it here is what
-            // makes the committed corpus cover the run's full fetch surface
-            // for an offline replay.
-            let v3_liquidity = fetch_v3_liquidity_logs_grouped(
-                &fetcher,
-                args.from_block,
-                args.to_block,
-                None, // whole-chain (the run's V3 scan is unfiltered)
-            )
-            .await
-            .map_err(|e| format!("fetch_v3_liquidity_logs_grouped: {e}"))?;
-            let liquidity_events: usize = v3_liquidity.values().map(Vec::len).sum();
-            events.len() + liquidity_events
-        }
-        Kind::Pool {
-            factory,
-            family: _,
-            verify: true,
-        } => {
-            // The verification-surface capture: seed the pool-update harness
-            // DB (one ACTIVE uniswap_v3 exchange stamped at from-1 - the same
-            // rows the replay suites seed) and run the REAL chunk loop with
-            // the pre-commit verification gate ON. Everything the run asks -
-            // the fetch passes PLUS the gate Multicall3 tick/bitmap reads -
-            // lands in the recording ledger.
-            let dir = tempfile::TempDir::new().map_err(|e| format!("tempdir: {e}"))?;
-            let db_path = dir.path().join("pool-verify.db");
-            seed_pool_update_db(&db_path, chain_id_i64, *factory, args.from_block)?;
-            let report = run_pool_update_off_runtime(
-                db_path,
-                chain_id_i64,
-                args.to_block,
-                args.to_block - args.from_block + 1,
-                recorder.as_alloy_provider(),
-                true,
-            )?;
-            report.total_pools_written + report.total_liquidity_applies
+        Kind::Pool { factory, family } => {
+            fetch_pool_created_logs(&fetcher, args.from_block, args.to_block, *factory, *family)
+                .await
+                .map_err(|e| format!("fetch_pool_created_logs: {e}"))?
+                .len()
         }
         Kind::Aave { pool } => {
             let logs = fetch_pool_logs(&fetcher, args.from_block, args.to_block, *pool)

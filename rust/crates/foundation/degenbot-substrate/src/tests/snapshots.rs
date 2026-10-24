@@ -167,12 +167,14 @@ fn seed_genesis_anchors_journal_without_advancing_clocks() {
     assert!(!core.has_state_prior_to(pool_id, 100));
     // Seed genesis at the DB floor anchor.
     assert_eq!(core.seed_genesis_by_pool_id(pool_id, db_block), Ok(pool_id));
-    assert!(core.has_state_prior_to(pool_id, 100), "non-empty journal");
+    assert!(core.has_state_prior_to(pool_id, head + 1));
+    assert!(!core.has_state_prior_to(pool_id, head));
+    assert!(!core.has_state_prior_to(pool_id, 100));
     // The anchor advances NO clock.
     assert_eq!(core.pool_update_block(pool_id), head);
     assert_eq!(core.pool_tick_data_block(pool_id), db_block);
-    // Restore below the anchor pops the before==after delta → seeded state.
-    let restored = core.restore_pool_before_block(pool_id, 100);
+    // A reorg after the seed leaves the imported state unchanged.
+    let restored = core.restore_pool_before_block(pool_id, head + 1);
     assert!(restored.unwrap().is_ok());
     assert_eq!(core.pool_update_block(pool_id), head);
     assert_eq!(core.pool_tick_data_block(pool_id), db_block);
@@ -265,7 +267,11 @@ fn v3_snapshot_seed_survives_pump_liquidity_update() {
     // `take_v3_snapshot_seed` returns the seed once and clears the slot
     // (memory is freed after step-1 verify; the seed is never needed again).
     let taken = core.take_v3_snapshot_seed(v3_addr);
-    assert_eq!(taken, Some(seed_clone), "take returns the pinned seed");
+    assert_eq!(
+        taken.map(|(seed, _block)| seed),
+        Some(seed_clone),
+        "take returns the pinned seed"
+    );
     assert_eq!(
         core.v3_snapshot_seed(v3_addr),
         None,
@@ -594,7 +600,11 @@ fn v4_snapshot_seed_survives_pump_modify_liquidity() {
 
     // take: returns the seed exactly once then clears.
     let taken = core.take_v4_snapshot_seed(pool_manager, &pool_id_bytes);
-    assert_eq!(taken, Some(seed_clone), "take returns the pinned seed");
+    assert_eq!(
+        taken.map(|(seed, _block)| seed),
+        Some(seed_clone),
+        "take returns the pinned seed"
+    );
     assert_eq!(
         core.v4_snapshot_seed(pool_manager, &pool_id_bytes),
         None,
@@ -826,27 +836,30 @@ fn pin_clamps_verify_block_to_complete_cutoff_when_pump_undrained() {
     use crate::RegisterV3PoolParams;
     let mut core = BotState::new();
     let pool_addr = Address::from([0xf8u8; 20]);
-    core.register_v3_pool(&RegisterV3PoolParams {
-        address: pool_addr,
-        token0: Address::ZERO,
-        token1: Address::from([1u8; 20]),
-        fee: 500,
-        tick_spacing: 10,
-        factory: Address::ZERO,
-        sqrt_price_x96: U256::from(1u128) << 96,
-        liquidity: 1_000_000,
-        tick: 0,
-        tick_data: HashMap::new(),
-        // DB-seeded seed: the liquidity clock is exact at block 100.
-        update_block: 100,
-        tick_data_block: Some(100),
-        coverage: PoolTickCoverage::Tracked,
-        fetcher: None,
-        ..Default::default()
-    })
-    .expect("test setup: V3 registration");
+    let pool_id = core
+        .register_v3_pool(&RegisterV3PoolParams {
+            address: pool_addr,
+            token0: Address::ZERO,
+            token1: Address::from([1u8; 20]),
+            fee: 500,
+            tick_spacing: 10,
+            factory: Address::ZERO,
+            sqrt_price_x96: U256::from(1u128) << 96,
+            liquidity: 1_000_000,
+            tick: 0,
+            tick_data: HashMap::new(),
+            update_block: 99,
+            tick_data_block: Some(99),
+            coverage: PoolTickCoverage::Tracked,
+            fetcher: None,
+            ..Default::default()
+        })
+        .expect("test setup: V3 registration");
     // Quarantine so live Mint/Burn route to the pump buffer.
     core.set_v3_pool_quarantined(pool_addr);
+    // A staged Swap advances the clock beyond the complete map seed; its
+    // same-block Mint is still pending, so that block is not complete.
+    core.apply_v3_swap_by_pool_id(pool_id, U256::from(1u128) << 96, 1_000_000, 0, 100, &[]);
     // Pump-buffer an UNDRAINED Mint at block 100, but only tombstone the
     // pump through block 99 → the drain (apply_pump_buffer_v3) holds the
     // block-100 event back, so the map is NOT complete at its 100 clock.

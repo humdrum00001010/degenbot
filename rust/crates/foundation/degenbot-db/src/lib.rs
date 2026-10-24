@@ -43,7 +43,6 @@ pub mod discovery;
 pub mod discovery_read;
 pub mod error;
 pub mod heal;
-pub mod liquidity_updater;
 pub mod migrate;
 pub mod migrations;
 pub mod ops;
@@ -60,17 +59,14 @@ pub mod species;
 /// OFF) — see [`sql_ledger`] for the structural zero-overhead argument.
 #[cfg(feature = "sql-ledger")]
 pub mod sql_ledger;
+pub mod tick_map_rows;
 pub mod write;
 
 pub use aave::{
     AaveCollateralPositionRecord, AaveDebtPositionRecord, AaveGhoAsset, AaveUserRecord,
 };
 pub use connection::DegenbotDb;
-/// Re-export the concentrated-liquidity-math in-memory liquidity types (`liquidity_gross: U128`,
-/// `liquidity_net: I256`, plus `bitmap: U256`) the liquidity updater applies
-/// against — aliased so they don't collide with the snapshot batch-read `U256`
-/// flavor above. These are the field types of `ComputedLiquidityUpdate` + the
-/// on-chain verifier's comparison inputs.
+/// Concentrated-liquidity row value types for low-level map storage.
 pub use degenbot_math::cl::liquidity_mapping::{
     BitmapAtWord as ApplyBitmapAtWord, LiquidityAtTick as ApplyLiquidityAtTick,
 };
@@ -91,10 +87,6 @@ pub use discovery_read::{
 };
 pub use error::DbError;
 pub use heal::{heal_database, HealReport};
-pub use liquidity_updater::{
-    derive_liquidity_delta_from_computed, BlockLog, ComputedLiquidityUpdate, LiquidityDelta,
-    LiquidityUpdateEvent, PoolUpdateState,
-};
 pub use migrate::{SchemaState, AUTO_HEAL_ENV};
 pub use migrations::{apply_rust_migrations, MigrationOutcome, MigrationStep, RUST_MIGRATIONS};
 pub use ops::{

@@ -24,10 +24,6 @@ def run_pool_update(
     chunk_size: int,
     rpc_url: str,
     cancel_handle: CancelHandle,
-    verify_chunk: bool = False,
-    *,
-    verify_all_interval: int | None = None,
-    verify_all_at_completion: bool = False,
 ) -> dict:
     """
     `degenbot._ffi.pool.run_pool_update(database_path, chain_id, to_block,
@@ -68,7 +64,7 @@ def run_pool_update(
     # Returns
 
     A `dict` `{chain_id, from_block, to_block, chunks_committed,
-    total_pools_written, total_liquidity_applies}`.
+    total_pools_written}`.
 
     # Raises
 
@@ -91,18 +87,8 @@ def verify_v3_liquidity_map(
     `degenbot._ffi.pool.verify_v3_liquidity_map(database_path, rpc_url, chain_id,
     pool_address, block_number) -> list[dict]`
 
-    Standalone on-chain-truth verification of a V3 pool's COMMITTED liquidity
-    map (read-only — no SQL writes, no event apply). Opens the DB, fetches the
-    pool's `liquidity_positions` + `initialization_maps` rows, builds the
-    in-memory map, + compares EVERY tick + bitmap word against on-chain
-    `IUniswapV3Pool.ticks(int24)` / `tickBitmap(int16)` at `block_number`, all
-    batched through Multicall3. Returns the divergence list (empty = GREEN —
-    the DB matches the chain at `block_number`).
-
-    This is the ad-hoc / spot-check sibling of the pre-commit gate
-    (`run_pool_update(verify=True)`); the gate runs the SAME core verify
-    BEFORE the write commits, while this reads the already-committed state.
-    Per-position `eth_call`s are batched via Multicall3.
+    Compare a complete Erigon map at `block_number` with ordinary V3 getters.
+    The database supplies only catalog identity and spacing.
 
     The GIL is released across the whole call (`py.detach`); the `AlloyProvider`
     is owned internally and the call runs on the ambient tokio runtime — a
@@ -122,12 +108,8 @@ def verify_v4_liquidity_map(
     `degenbot._ffi.pool.verify_v4_liquidity_map(database_path, rpc_url, chain_id,
     pool_hash, pool_manager_address, block_number) -> list[dict]`
 
-    Standalone on-chain-truth verification of a V4 pool's COMMITTED liquidity
-    map via the singleton `PoolManager.extsload(bytes32[])` at `block_number`
-    (read-only — mirrors [`verify_v3_liquidity_map`]). `pool_hash` is the V4
-    `PoolId` (bytes32 hex, `0x…`); `pool_manager_address` is the deployed V4
-    `PoolManager` singleton (the chain has one — it's the V4 exchange's
-    `factory`). Returns the divergence list (empty = GREEN).
+    Compare a complete Erigon map at `block_number` with `PoolManager` getters.
+    The database supplies only catalog identity and spacing.
 
     The GIL is released across the whole call; the provider is owned
     internally and the call runs on the ambient tokio runtime (a missing

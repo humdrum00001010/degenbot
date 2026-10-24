@@ -20,7 +20,7 @@ Build-graph coupling: `test_committed_stubs_match_generator_output` is the
 only place a plain Python-suite run enters the compile graph —
 `just gen-stubs --check` cargo-builds `degenbot_rs` (with the temporary
 `experimental-inspect` feature) and `degenbot-stubgen` before statically
-introspecting `rust/target/debug/libdegenbot_rs.so`. Run it with exclusive
+introspecting Cargo's platform-specific `degenbot_rs` library. Run it with exclusive
 use of the build graph: a concurrent `just dev` / `cargo build` in another
 lane holds the debug build lock and can relink that `.so` — without the
 introspection feature — while the check reads it, surfacing as an artifact

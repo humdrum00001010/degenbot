@@ -16,7 +16,6 @@
     }
   },
   "expected": {
-    "snapshot_seed_block": null,
     "discovery_count": 2,
     "graph": {
       "nodes": 2,
@@ -43,7 +42,7 @@
       "02-driver-config": "REACHABLE",
       "03-rpc-cascade": "REACHABLE",
       "04-db-path": "REACHABLE",
-      "05-snapshot-load": "REACHABLE",
+      "05-snapshot-load": "RETIRED",
       "06-engine-subscribe-resume": "REACHED-via-EngineDriver",
       "07-result-batch-stream": "REACHED-via-EngineDriver",
       "08-register-and-solve-path": "REACHED-via-EngineDriver",
@@ -62,12 +61,11 @@
     }
   },
   "python_reachable": {
-    "snapshot_seed_block": null,
     "graph_nodes": 2,
     "graph_candidate_tokens": [
       1
     ],
     "graph_edges": 0,
-    "note": "The Python consumer path reaches S via degenbot._ffi.Bot.load_snapshot_from_db and the parity.db graph via degenbot._ffi.build_path_graph (chain 8453). Discovery admits every token as an intermediate hop, so the Rust boot's candidate-token count (expected.graph.candidate_tokens) matches this unfiltered set."
+    "note": "The Python consumer reads the parity.db catalogue through degenbot._ffi.build_path_graph (chain 8453). Pool state initializes independently from complete canonical Erigon snapshots. Discovery admits every token as an intermediate hop, so the Rust boot's candidate-token count (expected.graph.candidate_tokens) matches this unfiltered set."
   }
 }

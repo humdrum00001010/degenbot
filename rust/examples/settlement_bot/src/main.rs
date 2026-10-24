@@ -381,15 +381,14 @@ impl SettlementBotConfig {
 /// Machine-checkable parity ledger rows for the boot report. The RSP-8
 /// running gate  diffs these lines between the Python and Rust
 /// drivers; `grep "^parity-ledger"` is the extraction contract.
-fn print_parity_ledger(snapshot_seed_block: Option<u64>) {
-    let s = snapshot_seed_block.map_or("None".to_string(), |s| s.to_string());
+fn print_parity_ledger() {
     #[rustfmt::skip]
     let rows: &[(&str, &str, &str)] = &[
         ("01-cli", "REACHABLE", "parse_cli (driver-local, mirrors runner/cli.py); one scheme-classified --node per transport (ADR-062 D6)"),
         ("02-driver-config", "REACHABLE", "build (mirrors runner/config.py)"),
         ("03-rpc-cascade", "REACHABLE", "degenbot::config::{resolve_node_request_uri,resolve_node_subscription_uri} (ADR-062 capability-scoped, file+env)"),
         ("04-db-path", "REACHABLE", "degenbot::config::resolve_database_path (+ offline.fixture_db typed key)"),
-        ("05-snapshot-load", "REACHABLE", "SnapshotDb::open + Bot::load_snapshot_from_db"),
+        ("05-snapshot-load", "RETIRED", "Pool builders initialize from complete canonical Erigon snapshots"),
         ("06-engine-subscribe-resume", "REACHED-via-EngineDriver", "EngineDriver::start → subscribe → verify-config (stops pre-resume); resume owns the S+1..W auto-backfill via BlockPump::backfill_with_drain"),
         ("07-result-batch-stream", "REACHED-via-EngineDriver", "EngineDriver::take_result_receiver (attach pre-resume); ResultBatch over the existing unbounded channel"),
         ("08-register-and-solve-path", "REACHED-via-EngineDriver", "EngineDriver::register_and_solve_path delegates to EngineStages"),
@@ -409,7 +408,6 @@ fn print_parity_ledger(snapshot_seed_block: Option<u64>) {
     for (row, status, note) in rows {
         println!("parity-ledger row={row} status={status} note={note}");
     }
-    println!("parity-ledger snapshot-seed-block S={s}");
 }
 
 // ── main ──────────────────────────────────────────────────────────────────
@@ -524,7 +522,7 @@ fn run() -> Result<(), String> {
         cfg.verification_retry_policy.jitter,
     );
 
-    // ── Boot slice (ledger row 5): DB snapshot load → seed block S ──
+    // Catalogue reads share one consistent database view during discovery.
     // The Python path loads the DB snapshot eagerly inside `Bot.__init__`
     // and stashes S on the shared state before `engine.subscribe(...)`.
     // Database path (ADR-062 D1/D4): `--database` > `DEGENBOT_DB_PATH` >
@@ -541,21 +539,6 @@ fn run() -> Result<(), String> {
     let (snap, _schema) = degenbot::db::snapshot_db::SnapshotDb::open(&db_path)
         .map_err(|e| format!("open snapshot DB {}: {e}", db_path.display()))?;
     let bot = degenbot::bot_core::Bot::new(CHAIN_ID);
-    // SnapshotDb holds the deferred read tx; it implements TickMapDb directly
-    // (degenbot_db::snapshot::TickMapDb is the trait the bot reads S through).
-    bot.load_snapshot_from_db(&snap, CHAIN_ID)
-        .map_err(|e| format!("load_snapshot_from_db on {}: {e}", db_path.display()))?;
-    let seed_block = bot
-        .state_arc()
-        .read_at(degenbot::substrate::state_lock::LockSite::Core)
-        .snapshot_seed_block();
-    println!(
-        "[boot] snapshot loaded from {} (chain {CHAIN_ID}) → S={:?}",
-        db_path.display(),
-        seed_block
-    );
-    degenbot::op_info!(domain = state, seed_block = ?seed_block, "boot: snapshot loaded");
-
     // ── Candidate-pool discovery (ledger row 11): the read-only enumeration
     // `build_paths.py` performs over its SQLAlchemy ORM, now reachable through
     // the umbrella on the SAME held-tx snapshot handle (Gap G2,).
@@ -694,7 +677,7 @@ fn run() -> Result<(), String> {
         println!("[g3] skip reasons: {}", breakdown.join(", "));
     }
 
-    print_parity_ledger(seed_block);
+    print_parity_ledger();
 
     // ── G5 operator channel (ledger row 20,) ──
     // A documented inert mode: serve the operator Unix socket WITHOUT RPC so
@@ -899,7 +882,6 @@ fn run() -> Result<(), String> {
             chain_id: CHAIN_ID,
             block: None,
             io: &io,
-            db: Some(&snap),
         };
         // The time-throttled registration-progress summary
         // (`pathfinding.reg_progress_secs`, declared default 30s) keeps the

@@ -66,16 +66,10 @@ pub enum TickMapPoolIdentity {
     },
 }
 
-/// Provenance of a staged tick map: which arm produced it. `Db` and `Chain`
-/// seeds carry an invariant (state precedence and coverage semantics) and can
-/// be minted only inside `bot_core`; `Journal` is exact-replay post-state
-/// truth owned by the same provisioning boundary.
+/// Provenance of a staged tick map: a complete chain snapshot or exact replay.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TickMapSource {
-    /// `TickMapDb::fetch_liquidity_map` supplied the complete map
-    /// (`Tracked`).
-    Db,
-    /// The sparse Chain bootstrap supplied one bitmap word (`Sparse`).
+    /// A complete pinned chain snapshot supplied the map (`Tracked`).
     Chain,
     /// Replayed post-frame journal tick words: exact-replay truth, not a
     /// fabricated ladder.
@@ -87,7 +81,6 @@ impl TickMapSource {
     #[must_use]
     pub const fn label(self) -> &'static str {
         match self {
-            Self::Db => "Db",
             Self::Chain => "Chain",
             Self::Journal => "Journal",
         }
@@ -95,13 +88,8 @@ impl TickMapSource {
 }
 
 /// A staged tick map plus the freshness stamp and provenance that must travel
-/// with it. `#[non_exhaustive]` seals construction to this crate: an external
-/// strategy cannot fabricate a seed (nor claim Db/Chain provenance) by struct
-/// literal. The `db`/`chain` constructors are additionally crate-private
-/// because Db/Chain provenance carries invariant-bearing state precedence —
-/// only `bot_core` provisioning may claim it. `journal` is public: a replayed
-/// journal's post-state words are exact-replay truth, and the backrun journal
-/// admission path owns them.
+/// with it. `#[non_exhaustive]` seals construction to this crate. Chain
+/// snapshots and replayed journal state are the supported seed sources.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct TickMapSeed {
@@ -124,30 +112,7 @@ pub struct TickMapSeed {
 }
 
 impl TickMapSeed {
-    /// A Db-arm seed. Crate-private: Db provenance is minted only by the
-    /// ingress.
-    #[must_use]
-    pub(crate) fn db(
-        ticks: hashbrown::HashMap<i32, TickInfo>,
-        bitmaps: hashbrown::HashMap<i32, U256>,
-        coverage: PoolTickCoverage,
-        block: u64,
-        source_block: Option<u64>,
-        identity: TickMapPoolIdentity,
-    ) -> Self {
-        Self {
-            ticks,
-            bitmaps,
-            coverage,
-            seed_block: block,
-            source_block,
-            identity,
-            source: TickMapSource::Db,
-        }
-    }
-
-    /// A Chain-arm seed. Crate-private: a sparse ladder is minted only by the
-    /// ingress chain bootstrap.
+    /// A complete chain snapshot seed.
     #[must_use]
     pub(crate) fn chain(
         ticks: hashbrown::HashMap<i32, TickInfo>,
@@ -168,7 +133,7 @@ impl TickMapSeed {
     }
 
     /// A Journal-arm seed for exact-replay tests inside the capability crate.
-    /// Production provisioning mints Db/Chain seeds through `PoolIngress`.
+    /// Production provisioning mints chain seeds through `PoolIngress`.
     #[cfg(test)]
     #[must_use]
     pub(crate) fn journal(
@@ -214,7 +179,7 @@ pub enum ExplicitPoolState {
         fee: u32,
         tick_spacing: i32,
         /// The staged tick map: ticks + coverage + freshness stamp +
-        /// provenance. Db/Chain provenance is minted only by the ingress;
+        /// provenance. Chain provenance is minted only by the ingress;
         /// Journal by the backrun replay admission.
         seed: TickMapSeed,
         /// The fork's storage-slot family — the layout the producer READ;

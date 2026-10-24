@@ -43,13 +43,13 @@ def test_recorded_comparator_has_teeth() -> None:
     fixture = dual_driver_gate.load_decisions_fixture()
     mutated = copy.deepcopy(fixture["rust"])
     for entry in mutated:
-        if entry["key"] == "snapshot_seed_block":
+        if entry["key"] == "discovery_count":
             entry["value"] = 99
     divergences = dual_driver_gate.diff_decisions(
         fixture["python"], mutated, fixture["permitted_divergence"]
     )
     assert divergences, "a mutated Rust decision must fail the gate"
-    assert any("snapshot_seed_block" in divergence for divergence in divergences)
+    assert any("discovery_count" in divergence for divergence in divergences)
 
 
 def test_missing_decision_is_a_divergence() -> None:
