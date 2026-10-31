@@ -26,9 +26,9 @@ use crate::bot::errmap::{map_driver_err, map_driver_lifecycle_err, map_verify_li
 /// (`http`, optional `view`) — the one-call `EngineDriver::start` detached
 /// from the GIL.
 ///
-/// The snapshot seed `S` must already be on the shared `BotState`; the driver
-/// reads it while subscribing, so `after_subscribe` can advance the phase to
-/// `SnapshotLoaded`.
+/// When the snapshot seed `S` is already on the shared `BotState`, the driver
+/// reads it while subscribing, so `after_subscribe` advances the phase to
+/// `SnapshotLoaded`; otherwise the phase stays `Subscribed` and `resume` still runs.
 ///
 /// # Errors
 /// `PyRuntimeError` if the phase is wrong, the pump is already

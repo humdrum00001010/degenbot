@@ -26,7 +26,7 @@
 //!    first complete block `W`, and pokes the verify config. It **stops before
 //!    `resume()`** so the consumer can attach its result receiver while no
 //!    batches can flow.
-//! 2. `resume()` gates on `PumpPhase::SnapshotLoaded`, **owns the
+//! 2. `resume()` gates on `PumpPhase::Subscribed`, **owns the
 //!    `S+1..W` auto-backfill** (awaiting `BlockPump::backfill_with_drain`
 //!    synchronously), then spawns the live pump loop and advances to
 //!    `PumpPhase::Resumed`. Consumers never call `backfill_from_snapshot`.
@@ -676,7 +676,7 @@ impl EngineDriver {
     ///
     /// # Errors
     ///
-    /// - [`DriverError::Phase`] when the phase is below `SnapshotLoaded`.
+    /// - [`DriverError::Phase`] when the phase is below `Subscribed`.
     /// - [`DriverError::SessionState`] when already `Resumed`, when no
     ///   subscribe state is pending, or when the driver is stopped.
     /// - [`DriverError::NoResultReceiver`] when the result receiver has not
@@ -710,11 +710,11 @@ impl EngineDriver {
             ));
         }
         let phase = self.stages.current_phase();
-        if let Err(detail) = phase.require(PumpPhase::SnapshotLoaded, "resume") {
+        if let Err(detail) = phase.require(PumpPhase::Subscribed, "resume") {
             return Err(DriverError::Phase(PhaseError {
                 method: "resume",
                 current: phase,
-                required: Some(PumpPhase::SnapshotLoaded),
+                required: Some(PumpPhase::Subscribed),
                 detail,
             }));
         }
@@ -1418,7 +1418,7 @@ mod tests {
             DriverError::Phase(p) => {
                 assert_eq!(p.method, "resume");
                 assert_eq!(p.current, PumpPhase::Created);
-                assert_eq!(p.required, Some(PumpPhase::SnapshotLoaded));
+                assert_eq!(p.required, Some(PumpPhase::Subscribed));
             }
             other => assert!(
                 !matches!(other, DriverError::Phase(_)),
@@ -1757,6 +1757,31 @@ mod tests {
         assert!(matches!(err, DriverError::SessionState(_)), "got {err:?}");
         driver.stop().expect("stop");
         assert!(!driver.pump_handle_armed());
+    }
+
+    #[test]
+    fn resume_from_subscribed_starts_the_pump_before_any_pool_is_registered() {
+        let driver = driver_for_test();
+        let _result_rx = driver.take_result_receiver();
+        let pump = BlockPump::for_test(
+            Arc::clone(driver.bot()),
+            driver.stages().clone(),
+            driver.stages().clone(),
+            Arc::new(ReorgCoordinator::new(Arc::clone(driver.bot()))),
+            mock_provider(),
+            Arc::clone(&driver.shutdown),
+        );
+        driver.install_subscribe_state_for_test(DriverSubscribeState {
+            pump,
+            first_block: 100,
+            combined_stream: futures_util::stream::empty().boxed(),
+        });
+        driver.set_phase(PumpPhase::Subscribed);
+        degenbot_core::runtime::get_runtime()
+            .block_on(driver.resume())
+            .expect("a cold start resumes from Subscribed");
+        assert_eq!(driver.current_phase(), PumpPhase::Resumed);
+        driver.stop().expect("stop");
     }
 
     #[test]

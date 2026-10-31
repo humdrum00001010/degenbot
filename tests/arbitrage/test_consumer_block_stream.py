@@ -15,7 +15,7 @@ and assert:
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, ClassVar
 
 import asyncio
 
@@ -300,6 +300,43 @@ class TestBlockClockFromStream:
         assert dispatched[0] != 999, (
             "dispatch must key off the block-stream clock, never the batch's stale solve_block"
         )
+
+
+class _RecordingPipeline(StubPipeline):
+    """StubPipeline that keeps the enqueued batches for inspection."""
+
+    batches: ClassVar[list[Any]] = []
+
+    def enqueue(self, work: Any) -> None:
+        super().enqueue(work)
+        _RecordingPipeline.batches.append(work)
+
+
+class TestUnencodableAmounts:
+    """The executor encodes swap amounts in 12 bytes: wider rows cannot execute."""
+
+    async def test_rows_wider_than_uint96_are_dropped_before_the_ffi(self) -> None:
+        _RecordingPipeline.batches.clear()
+        batch = dict(_empty_batch(300))
+        batch["fresh"] = [
+            (1, 100, 50, (1, 2), (3,), (0,)),
+            (2, 100, 50, (1, 1 << 96), (3,), (0,)),
+            (3, 100, 50, (1, 2), (1 << 200,), (0,)),
+        ]
+        await _run_with_pipeline_factory(
+            _RecordingPipeline, blocks=[_block(301)], batches=[batch]
+        )
+        enqueued = [row.path_id for work in _RecordingPipeline.batches for row in work.results]
+        assert enqueued == [1]
+
+    async def test_a_batch_with_only_unencodable_rows_enqueues_nothing(self) -> None:
+        _RecordingPipeline.batches.clear()
+        batch = dict(_empty_batch(300))
+        batch["fresh"] = [(2, 100, 50, (1 << 96,), (3,), (0,))]
+        await _run_with_pipeline_factory(
+            _RecordingPipeline, blocks=[_block(301)], batches=[batch]
+        )
+        assert _RecordingPipeline.batches == []
 
 
 class TestPumpDeathVisible:

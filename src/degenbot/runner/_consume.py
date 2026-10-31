@@ -289,6 +289,21 @@ def _engine_result(item: Any, solve_block: int) -> RawEngineResult:
     )
 
 
+# The executor carries every swap amount in a 12-byte field.
+_MAX_ENCODABLE_AMOUNT = (1 << 96) - 1
+
+
+def _is_encodable(result: RawEngineResult) -> bool:
+    """Whether every amount of the row fits the executor's amount field.
+
+    Returns:
+        ``False`` for a row no executor payload can carry (a degenerate pool).
+
+    """
+    amounts = result.hop_outputs + result.consumed_inputs
+    return max(amounts, default=0) <= _MAX_ENCODABLE_AMOUNT
+
+
 def _apply_result_if_ready(
     fut: asyncio.Task[dict[str, object]],
     session: _SessionState,
@@ -310,8 +325,11 @@ def _apply_result_if_ready(
     current_block = session.dispatcher.current_block
     solve_block = int(cast("Any", batch["solve_block"]))
 
-    results = [_engine_result(item, solve_block) for item in cast("Any", batch["fresh"])]
-    results += [_engine_result(item, solve_block) for item in cast("Any", batch["updated"])]
+    results = [
+        result
+        for item in (*cast("Any", batch["fresh"]), *cast("Any", batch["updated"]))
+        if _is_encodable(result := _engine_result(item, solve_block))
+    ]
 
     for path_id in cast("Any", batch["removed"]):
         session.dispatcher.discard_path(int(path_id))
